@@ -19,7 +19,7 @@ import json
 import numpy as np
 import polars as pl
 
-from config import MODELS, SEED, train_cutoffs
+from config import CUTOFF_STRIDE, HORIZON, MODELS, SEED, train_cutoffs
 from datasets import feature_names, features_version, get_dataset, parse_blocks
 from metrics import report, rmse_log
 from models import GBM
@@ -27,18 +27,29 @@ from utils import append_csv, git_commit
 
 
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
-               val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None):
+               val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
+               stride: int | None = None):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
     обучение на низком уровне площадки и валидация на высоком — так проверяется
     устойчивость к сдвигу уровня, которого штатная валидация не видит.
     """
-    cuts = train_cutoffs(n_cutoffs)
+    cuts = train_cutoffs(n_cutoffs, stride)
     val_cut = val_cutoff or cuts[0]
     train_cuts = explicit_train if explicit_train else [c for c in cuts if c < val_cut]
+
+    # Карантин: окно таргета обучающего среза не должно заходить в окно валидации,
+    # иначе модель учится на тех же днях, по которым её проверяют. При шаге 30
+    # это условие выполняется само, при шаге 14 отбрасывает ближайшие срезы.
+    latest_ok = val_cut - dt.timedelta(days=HORIZON)
+    dropped = [c for c in train_cuts if c > latest_ok]
+    train_cuts = [c for c in train_cuts if c <= latest_ok]
+    if dropped:
+        print(f"карантин: отброшено срезов {len(dropped)} "
+              f"({', '.join(str(c) for c in dropped)}) — их таргет пересекается с валидацией")
     if not train_cuts:
-        raise SystemExit(f"нет обучающих срезов раньше {val_cut}: увеличьте --cutoffs")
+        raise SystemExit(f"нет обучающих срезов раньше {latest_ok}: увеличьте --cutoffs")
     cuts = [val_cut, *train_cuts]
     val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks)
     trains = [get_dataset(c, rebuild=rebuild, blocks=blocks) for c in train_cuts]
@@ -86,6 +97,8 @@ def main() -> None:
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val фиксированным числом итераций и сохранить для сабмита")
     ap.add_argument("--note", default="", help="что проверяем — попадёт в журнал экспериментов")
+    ap.add_argument("--stride", type=int, default=None,
+                    help="шаг между срезами в днях (по умолчанию 30 = длина окна таргета)")
     ap.add_argument("--val-cutoff", default=None, help="валидационный срез, ГГГГ-ММ-ДД")
     ap.add_argument("--train-cutoffs", default=None,
                     help="явный список обучающих срезов через запятую, ГГГГ-ММ-ДД")
@@ -99,7 +112,8 @@ def main() -> None:
     explicit_train = [parse_date(d.strip()) for d in args.train_cutoffs.split(",")] if args.train_cutoffs else None
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
-                                         val_cutoff=val_cutoff, explicit_train=explicit_train)
+                                         val_cutoff=val_cutoff, explicit_train=explicit_train,
+                                         stride=args.stride)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -141,7 +155,8 @@ def main() -> None:
         MODELS / "experiments.csv",
         ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
          "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
-         "gini_blend", "sum_bias_blend", "best_iter_single", "val_cutoff", "train_cutoffs", "note"],
+         "gini_blend", "sum_bias_blend", "best_iter_single", "stride", "val_cutoff",
+         "train_cutoffs", "note"],
         {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": git_commit(), "feat_ver": features_version(blocks),
@@ -149,6 +164,7 @@ def main() -> None:
             "model": args.model, "cutoffs": len(cuts) - 1, "n_features": len(feats),
             # Без этих двух колонок строка стресс-теста неотличима от штатной,
             # а сравнивать их между собой нельзя.
+            "stride": args.stride or CUTOFF_STRIDE,
             "val_cutoff": str(cuts[0]),
             "train_cutoffs": " ".join(str(c) for c in cuts[1:]),
             "rmsle_single": round(res["single"]["rmsle"], 5),

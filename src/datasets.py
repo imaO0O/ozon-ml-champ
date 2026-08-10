@@ -74,12 +74,14 @@ def main() -> None:
     ap.add_argument("--blocks", default=None,
                     help=f"подмножество блоков через запятую (есть: {','.join(sorted(BLOCKS))})")
     ap.add_argument("--clean", action="store_true", help="удалить кэш прошлых версий признаков")
+    ap.add_argument("--stride", type=int, default=None, help="шаг между срезами в днях")
     args = ap.parse_args()
 
     blocks = parse_blocks(args.blocks)
     if args.clean:
         clean_stale_cache(features_version(blocks))
-    cuts = train_cutoffs() if args.cutoffs is None else train_cutoffs(args.cutoffs)
+    n = args.cutoffs if args.cutoffs is not None else None
+    cuts = train_cutoffs(stride=args.stride) if n is None else train_cutoffs(n, args.stride)
     for c in cuts:
         get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks)
     if args.test:

@@ -30,9 +30,16 @@ TEST_CUTOFF = dt.date(2026, 2, 14)
 LAST_TRAIN_CUTOFF = dt.date(2026, 1, 15)
 N_TRAIN_CUTOFFS = 6
 
-def train_cutoffs(n: int = N_TRAIN_CUTOFFS) -> list[dt.date]:
-    """От свежего к старому: 2026-01-15, 2025-12-16, 2025-11-16, ..."""
-    return [LAST_TRAIN_CUTOFF - dt.timedelta(days=HORIZON * i) for i in range(n)]
+# Шаг между срезами. При шаге меньше HORIZON окна таргета соседних срезов
+# пересекаются: примеров больше, но они скоррелированы, а обучающие срезы
+# рядом с валидационным приходится отбрасывать (карантин в train.py).
+CUTOFF_STRIDE = HORIZON
+
+
+def train_cutoffs(n: int = N_TRAIN_CUTOFFS, stride: int | None = None) -> list[dt.date]:
+    """От свежего к старому: при шаге 30 — 2026-01-15, 2025-12-16, 2025-11-16, ..."""
+    step = CUTOFF_STRIDE if stride is None else stride
+    return [LAST_TRAIN_CUTOFF - dt.timedelta(days=step * i) for i in range(n)]
 
 # Окна для агрегатов (в днях до cutoff).
 WINDOWS = [7, 14, 30, 60, 90, 180, 365]
