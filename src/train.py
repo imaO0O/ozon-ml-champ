@@ -13,22 +13,24 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 
 import numpy as np
 import polars as pl
 
 from config import MODELS, SEED, train_cutoffs
-from datasets import feature_names, get_dataset
+from datasets import feature_names, features_version, get_dataset, parse_blocks
 from metrics import report, rmse_log
 from models import GBM
+from utils import append_csv, git_commit
 
 
-def load_split(n_cutoffs: int, rebuild: bool = False):
+def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None):
     cuts = train_cutoffs(n_cutoffs)
     val_cut, train_cuts = cuts[0], cuts[1:]
-    val = get_dataset(val_cut, rebuild=rebuild)
-    trains = [get_dataset(c, rebuild=rebuild) for c in train_cuts]
+    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks)
+    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks) for c in train_cuts]
     feats = feature_names(val)
     trains = [t.select(["user_id", *feats, "target"]) for t in trains]
     train = pl.concat(trains, how="vertical")
@@ -72,10 +74,14 @@ def main() -> None:
     ap.add_argument("--name", default=None, help="имя артефактов (по умолчанию = --model)")
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val фиксированным числом итераций и сохранить для сабмита")
+    ap.add_argument("--note", default="", help="что проверяем — попадёт в журнал экспериментов")
+    ap.add_argument("--blocks", default=None,
+                    help="подмножество блоков признаков через запятую (ablation)")
     args = ap.parse_args()
     name = args.name or args.model
+    blocks = parse_blocks(args.blocks)
 
-    train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild)
+    train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -106,9 +112,31 @@ def main() -> None:
     meta = {
         "name": name, "model": args.model, "device": args.device,
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
-        "metrics": res, "seed": SEED,
+        "metrics": res, "seed": SEED, "features_version": features_version(blocks),
+        "blocks": blocks or "all",
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
+
+    # Журнал экспериментов: одна строка на прогон, чтобы результаты команды
+    # можно было сравнивать между собой, а не по скриншотам в чате.
+    append_csv(
+        MODELS / "experiments.csv",
+        ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
+         "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
+         "gini_blend", "sum_bias_blend", "best_iter_single", "note"],
+        {
+            "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "commit": git_commit(), "feat_ver": features_version(blocks),
+            "blocks": ",".join(blocks) if blocks else "all", "name": name,
+            "model": args.model, "cutoffs": args.cutoffs, "n_features": len(feats),
+            "rmsle_single": round(res["single"]["rmsle"], 5),
+            "rmsle_two_stage": round(res["two_stage"]["rmsle"], 5),
+            "rmsle_blend": round(res["blend"]["rmsle"], 5), "blend_w": round(best_w, 2),
+            "gini_blend": round(res["blend"]["gini"], 4),
+            "sum_bias_blend": round(res["blend"]["sum_bias"], 4),
+            "best_iter_single": single.best_iter, "note": args.note,
+        },
+    )
 
     if args.final:
         # Данных стало больше на 1/(n-1) — примерно во столько же раз растим число итераций.

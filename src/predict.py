@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import json
-import subprocess
 
 import numpy as np
 import polars as pl
@@ -13,14 +11,16 @@ import polars as pl
 from config import MODELS, SAMPLE_SUBMIT, SUBMISSIONS, TEST_CUTOFF
 from datasets import get_dataset
 from models import GBM
+from utils import append_csv, git_commit
 
 # Признаки-счётчики у «спящего» пользователя равны нулю, а не «неизвестны».
 ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
 
 
-def build_test_frame(features: list[str], rebuild: bool = False) -> tuple[pl.Series, np.ndarray]:
+def build_test_frame(features: list[str], rebuild: bool = False,
+                     blocks: list[str] | None = None) -> tuple[pl.Series, np.ndarray]:
     users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
-    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild)
+    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks)
     df = users.join(feats, on="user_id", how="left")
     missing = df[features[0]].null_count()
     if missing:
@@ -32,30 +32,15 @@ def build_test_frame(features: list[str], rebuild: bool = False) -> tuple[pl.Ser
     return df["user_id"], X
 
 
-def git_commit() -> str:
-    try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
-                              text=True, cwd=SUBMISSIONS.parent).stdout.strip() or "?"
-    except Exception:
-        return "?"
-
-
 def log_submission(row: dict) -> None:
     """Журнал сабмитов: какой файл каким кодом и с какой валидацией получен.
 
     Нужен и команде (5 сабмитов в день на всех), и жюри — воспроизводимость.
     Поле lb_score заполняется руками после ответа лидерборда.
     """
-    path = SUBMISSIONS / "log.csv"
     fields = ["file", "created", "commit", "name", "model", "blend_w",
               "val_rmsle", "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"]
-    new = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if new:
-            w.writeheader()
-        w.writerow({k: row.get(k, "") for k in fields})
-    print(f"записано в {path}")
+    append_csv(SUBMISSIONS / "log.csv", fields, row)
 
 
 def main() -> None:
@@ -70,8 +55,10 @@ def main() -> None:
     if not meta.get("final"):
         raise SystemExit(f"модели '{args.name}' обучены без --final, для сабмита переобучите train.py --final")
     features, w = meta["features"], meta["blend_w"]
+    # Тестовые признаки собираем тем же набором блоков, что и обучающие.
+    blocks = meta.get("blocks") if meta.get("blocks") != "all" else None
 
-    user_id, X = build_test_frame(features, rebuild=args.rebuild)
+    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks)
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
     reg = GBM.load(MODELS / f"{args.name}_reg.pkl")

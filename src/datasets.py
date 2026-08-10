@@ -3,28 +3,44 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import time
+from pathlib import Path
 
 import polars as pl
 
 from config import DATA_PROC, TEST_CUTOFF, TRAIN_PARQUET, train_cutoffs
-from features import build_dataset
+from features import BLOCKS, build_dataset
 
 ID = "user_id"
 NON_FEATURES = {ID, "target", "cutoff"}
 
 
-def dataset_path(cutoff: dt.date):
-    # Имя источника в пути кэша, чтобы синтетика и реальные данные не смешивались.
-    return DATA_PROC / f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}.parquet"
+def features_version(blocks: list[str] | None = None) -> str:
+    """Хеш кода признаков: любое изменение блоков или config.py обесценивает кэш.
+
+    Без этого сокомандник, добавивший признак, молча обучится на старом кэше
+    и решит, что его идея не работает. Пересборка стоит ~20 секунд на срез.
+    """
+    pkg = Path(__file__).with_name("features")
+    src = b"".join(p.read_bytes() for p in sorted(pkg.glob("*.py")))
+    src += Path(__file__).with_name("config.py").read_bytes()
+    src += ("|".join(blocks) if blocks else "all").encode()
+    return hashlib.md5(src).hexdigest()[:8]
 
 
-def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False) -> pl.DataFrame:
-    path = dataset_path(cutoff)
+def dataset_path(cutoff: dt.date, blocks: list[str] | None = None):
+    # В имени — источник данных (синтетика/реальные) и версия кода признаков.
+    return DATA_PROC / f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}.parquet"
+
+
+def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
+                blocks: list[str] | None = None) -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
-    df = build_dataset(cutoff, with_target=with_target)
+    df = build_dataset(cutoff, with_target=with_target, blocks=blocks)
     df.write_parquet(path)
     print(f"[{cutoff}] {df.height:,} строк x {df.width} колонок за {time.time() - t0:.1f}s -> {path.name}")
     return df
@@ -34,18 +50,40 @@ def feature_names(df: pl.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in NON_FEATURES]
 
 
+def clean_stale_cache(keep: str) -> None:
+    """Удалить выборки прошлых версий признаков — каждая версия весит ~360 МБ."""
+    freed = 0
+    for p in DATA_PROC.glob("ds_*.parquet"):
+        if p.stem.endswith(keep):
+            continue
+        freed += p.stat().st_size
+        p.unlink()
+    print(f"освобождено {freed / 1024 ** 2:.0f} МБ, оставлена версия {keep}")
+
+
+def parse_blocks(value: str | None) -> list[str] | None:
+    """--blocks windows,lifetime — для замера вклада отдельных блоков."""
+    return [b.strip() for b in value.split(",") if b.strip()] if value else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cutoffs", type=int, default=None, help="сколько обучающих cutoff'ов собрать")
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--test", action="store_true", help="собрать также выборку на TEST_CUTOFF (без таргета)")
+    ap.add_argument("--blocks", default=None,
+                    help=f"подмножество блоков через запятую (есть: {','.join(sorted(BLOCKS))})")
+    ap.add_argument("--clean", action="store_true", help="удалить кэш прошлых версий признаков")
     args = ap.parse_args()
 
+    blocks = parse_blocks(args.blocks)
+    if args.clean:
+        clean_stale_cache(features_version(blocks))
     cuts = train_cutoffs() if args.cutoffs is None else train_cutoffs(args.cutoffs)
     for c in cuts:
-        get_dataset(c, with_target=True, rebuild=args.rebuild)
+        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks)
     if args.test:
-        get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild)
+        get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks)
 
 
 if __name__ == "__main__":

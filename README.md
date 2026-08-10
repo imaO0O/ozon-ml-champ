@@ -95,7 +95,39 @@ OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.c
 Кроме RMSLE считаются нормированный Gini и относительная ошибка суммарного
 предсказанного GMV — оба используются жюри на этапе отбора финалистов.
 
-## Признаки
+## Признаки: как добавить свой блок
+
+Признаки собираются из независимых блоков — так несколько человек добавляют
+свои, не встречаясь в мержах. Блок = модуль в `src/features/` с одной или
+двумя функциями:
+
+```python
+# src/features/my_block.py
+import polars as pl
+from .registry import aggs_block, derived_block
+
+@aggs_block("my_block")           # выражения внутри group_by("user_id").agg(...)
+def my_aggs(cutoff):              # доступны колонки лога и days_ago (>= 1)
+    return [pl.col("gmv").filter(pl.col("days_ago") <= 45).sum().alias("gmv_sum_45")]
+
+@derived_block("my_block")        # выражения поверх готовых агрегатов
+def my_derived():
+    return [(pl.col("gmv_sum_45") / (pl.col("gmv_sum_365") + 1e-6)).alias("gmv_share_45")]
+```
+
+плюс строка `from . import my_block` в конце `src/features/__init__.py`.
+
+Вклад своего блока меряется тем же `train.py` с `--blocks`:
+
+```bash
+python src/train.py --blocks windows,lifetime,ratios          # без своего блока
+python src/train.py --blocks windows,lifetime,ratios,my_block # с ним
+```
+
+Кэш выборок привязан к хешу кода признаков и к набору блоков, поэтому после
+правки он пересобирается сам — чистить руками ничего не нужно.
+
+## Что уже есть в признаках
 
 Всё считается строго по данным **до** cutoff'а:
 
@@ -111,12 +143,20 @@ OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.c
 ## Структура
 
 ```
-src/config.py         пути, даты, cutoff'ы
-src/features.py       оконные агрегаты и деривативы на polars
-src/datasets.py       сборка и кэш выборок по cutoff'ам
-src/models.py         обёртка над LightGBM / CatBoost / XGBoost (CPU и GPU)
-src/metrics.py        RMSLE, Gini, ошибка суммарного GMV
-src/train.py          обучение, валидация, финальный фит
-src/predict.py        сборка сабмита на 250k пользователей
-src/make_fake_data.py синтетический лог для прогона пайплайна
+src/config.py             пути, даты, cutoff'ы
+src/features/registry.py  реестр блоков признаков
+src/features/windows.py   оконные агрегаты 7 … 365 дней
+src/features/lifetime.py  вся история, рецентность, BTYD
+src/features/ratios.py    отношения и тренды поверх агрегатов
+src/datasets.py           сборка и кэш выборок (кэш привязан к версии признаков)
+src/models.py             обёртка над LightGBM / CatBoost / XGBoost (CPU и GPU)
+src/metrics.py            RMSLE, Gini, смещение суммарного GMV
+src/train.py              обучение, валидация, финальный фит, журнал экспериментов
+src/predict.py            сборка сабмита на 250k пользователей
+src/eda.py                обзор данных и наивные бенчмарки
+src/make_fake_data.py     синтетический лог для прогона пайплайна
 ```
+
+Журналы, которые лежат в git: `models/experiments.csv` (строка на каждый прогон
+обучения) и `submissions/log.csv` (строка на каждый сабмит). Веса, кэш и сами
+csv-сабмиты не коммитятся.

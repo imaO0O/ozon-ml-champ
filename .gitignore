@@ -2,12 +2,15 @@
 __pycache__/
 *.py[cod]
 
-# Данные соревнования и всё производное — не в репозиторий
+# Данные соревнования и кэш признаков — не в репозиторий
 data/
-models/
-submissions/
-*.parquet
-*.pkl
+
+# Веса и сабмиты не коммитим, а вот журналы — обязательно:
+# по ним команда сравнивает эксперименты, а жюри проверяет воспроизводимость.
+models/*
+!models/experiments.csv
+submissions/*
+!submissions/log.csv
 
 .claude/
 .ipynb_checkpoints/
