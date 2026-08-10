@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Данные соревнования и всё производное — не в репозиторий
+data/
+models/
+submissions/
+*.parquet
+*.pkl
+
+.claude/
+.ipynb_checkpoints/
+.idea/
+.vscode/

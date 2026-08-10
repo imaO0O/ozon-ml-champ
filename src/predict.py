@@ -1,0 +1,64 @@
+"""Сборка сабмита: признаки на TEST_CUTOFF -> предсказание -> csv для всех 250k."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+
+import numpy as np
+import polars as pl
+
+from config import MODELS, SAMPLE_SUBMIT, SUBMISSIONS, TEST_CUTOFF
+from datasets import get_dataset
+from models import GBM
+
+# Признаки-счётчики у «спящего» пользователя равны нулю, а не «неизвестны».
+ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
+
+
+def build_test_frame(features: list[str], rebuild: bool = False) -> tuple[pl.Series, np.ndarray]:
+    users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
+    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild)
+    df = users.join(feats, on="user_id", how="left")
+    missing = df[features[0]].null_count()
+    if missing:
+        print(f"внимание: {missing:,} пользователей без истории до {TEST_CUTOFF} — заполняю нулями")
+    fills = [pl.col(c).fill_null(0.0) for c in features if any(h in c for h in ZERO_FILL_HINTS)]
+    if fills:
+        df = df.with_columns(fills)
+    X = df.select(features).to_numpy().astype(np.float32)
+    return df["user_id"], X
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", default="lgbm", help="имя артефактов из models/")
+    ap.add_argument("--out", default=None, help="имя файла сабмита")
+    ap.add_argument("--rebuild", action="store_true")
+    args = ap.parse_args()
+
+    meta = json.loads((MODELS / f"{args.name}_meta.json").read_text(encoding="utf-8"))
+    if not meta.get("final"):
+        raise SystemExit(f"модели '{args.name}' обучены без --final, для сабмита переобучите train.py --final")
+    features, w = meta["features"], meta["blend_w"]
+
+    user_id, X = build_test_frame(features, rebuild=args.rebuild)
+    single = GBM.load(MODELS / f"{args.name}_single.pkl")
+    clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
+    reg = GBM.load(MODELS / f"{args.name}_reg.pkl")
+
+    pred_log = (1 - w) * single.predict(X) + w * (clf.predict(X) * reg.predict(X))
+    pred = np.clip(np.expm1(np.clip(pred_log, 0, None)), 0, None)
+
+    out = args.out or f"{args.name}_{dt.date.today():%m%d}.csv"
+    path = SUBMISSIONS / out
+    pl.DataFrame({"user_id": user_id, "predict": pred.astype(np.float32)}).write_csv(path)
+
+    print(f"\n{path}")
+    print(f"строк: {len(pred):,} | нулевых: {(pred < 1e-6).mean():.2%} | "
+          f"среднее: {pred.mean():.2f} | медиана: {np.median(pred):.2f} | max: {pred.max():,.0f}")
+    print(f"суммарный предсказанный GMV: {pred.sum():,.0f}")
+
+
+if __name__ == "__main__":
+    main()
