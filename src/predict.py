@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
+import subprocess
 
 import numpy as np
 import polars as pl
@@ -30,11 +32,38 @@ def build_test_frame(features: list[str], rebuild: bool = False) -> tuple[pl.Ser
     return df["user_id"], X
 
 
+def git_commit() -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                              text=True, cwd=SUBMISSIONS.parent).stdout.strip() or "?"
+    except Exception:
+        return "?"
+
+
+def log_submission(row: dict) -> None:
+    """Журнал сабмитов: какой файл каким кодом и с какой валидацией получен.
+
+    Нужен и команде (5 сабмитов в день на всех), и жюри — воспроизводимость.
+    Поле lb_score заполняется руками после ответа лидерборда.
+    """
+    path = SUBMISSIONS / "log.csv"
+    fields = ["file", "created", "commit", "name", "model", "blend_w",
+              "val_rmsle", "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"]
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in fields})
+    print(f"записано в {path}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="lgbm", help="имя артефактов из models/")
     ap.add_argument("--out", default=None, help="имя файла сабмита")
     ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--note", default="", help="комментарий для журнала сабмитов")
     args = ap.parse_args()
 
     meta = json.loads((MODELS / f"{args.name}_meta.json").read_text(encoding="utf-8"))
@@ -58,6 +87,17 @@ def main() -> None:
     print(f"строк: {len(pred):,} | нулевых: {(pred < 1e-6).mean():.2%} | "
           f"среднее: {pred.mean():.2f} | медиана: {np.median(pred):.2f} | max: {pred.max():,.0f}")
     print(f"суммарный предсказанный GMV: {pred.sum():,.0f}")
+
+    val = meta.get("metrics", {}).get("blend", {})
+    log_submission({
+        "file": out, "created": dt.datetime.now().isoformat(timespec="seconds"),
+        "commit": git_commit(), "name": args.name, "model": meta.get("model"),
+        "blend_w": round(w, 2), "val_rmsle": round(val.get("rmsle", float("nan")), 5),
+        "val_gini": round(val.get("gini", float("nan")), 4),
+        "val_sum_err": round(val.get("rmspe_total", float("nan")), 4),
+        "pred_sum": round(float(pred.sum())), "pred_zeros": f"{(pred < 1e-6).mean():.4f}",
+        "note": args.note,
+    })
 
 
 if __name__ == "__main__":
