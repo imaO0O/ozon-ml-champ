@@ -1,3 +1,3 @@
-created,commit,feat_ver,name,model,cutoffs,n_features,rmsle_single,rmsle_two_stage,rmsle_blend,blend_w,gini_blend,sum_bias_blend,best_iter_single,note
-2026-08-10T21:01:18,369f7ab+dirty,4e7225b5,lgbm,lgbm,6,161,1.68685,1.6851,1.68507,0.9,0.7383,-0.4859,147,"базовая линия: 161 признак, 6 срезов"
+created,commit,feat_ver,blocks,name,model,cutoffs,n_features,rmsle_single,rmsle_two_stage,rmsle_blend,blend_w,gini_blend,sum_bias_blend,best_iter_single,note
+2026-08-10T21:01:18,369f7ab+dirty,4e7225b5,all,lgbm,lgbm,6,161,1.68685,1.6851,1.68507,0.9,0.7383,-0.4859,147,"базовая линия: 161 признак, 6 срезов"
 2026-08-10T21:15:41,369f7ab+dirty,4d452069,all,lgbm,lgbm,6,161,1.68643,1.68534,1.6852,0.75,0.738,-0.4879,155,после разбиения признаков на блоки
