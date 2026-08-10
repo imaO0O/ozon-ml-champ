@@ -26,9 +26,20 @@ from models import GBM
 from utils import append_csv, git_commit
 
 
-def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None):
+def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
+               val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None):
+    """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
+
+    `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
+    обучение на низком уровне площадки и валидация на высоком — так проверяется
+    устойчивость к сдвигу уровня, которого штатная валидация не видит.
+    """
     cuts = train_cutoffs(n_cutoffs)
-    val_cut, train_cuts = cuts[0], cuts[1:]
+    val_cut = val_cutoff or cuts[0]
+    train_cuts = explicit_train if explicit_train else [c for c in cuts if c < val_cut]
+    if not train_cuts:
+        raise SystemExit(f"нет обучающих срезов раньше {val_cut}: увеличьте --cutoffs")
+    cuts = [val_cut, *train_cuts]
     val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks)
     trains = [get_dataset(c, rebuild=rebuild, blocks=blocks) for c in train_cuts]
     feats = feature_names(val)
@@ -75,13 +86,20 @@ def main() -> None:
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val фиксированным числом итераций и сохранить для сабмита")
     ap.add_argument("--note", default="", help="что проверяем — попадёт в журнал экспериментов")
+    ap.add_argument("--val-cutoff", default=None, help="валидационный срез, ГГГГ-ММ-ДД")
+    ap.add_argument("--train-cutoffs", default=None,
+                    help="явный список обучающих срезов через запятую, ГГГГ-ММ-ДД")
     ap.add_argument("--blocks", default=None,
                     help="подмножество блоков признаков через запятую (ablation)")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
+    parse_date = dt.date.fromisoformat
+    val_cutoff = parse_date(args.val_cutoff) if args.val_cutoff else None
+    explicit_train = [parse_date(d.strip()) for d in args.train_cutoffs.split(",")] if args.train_cutoffs else None
 
-    train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks)
+    train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
+                                         val_cutoff=val_cutoff, explicit_train=explicit_train)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -123,12 +141,16 @@ def main() -> None:
         MODELS / "experiments.csv",
         ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
          "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
-         "gini_blend", "sum_bias_blend", "best_iter_single", "note"],
+         "gini_blend", "sum_bias_blend", "best_iter_single", "val_cutoff", "train_cutoffs", "note"],
         {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": git_commit(), "feat_ver": features_version(blocks),
             "blocks": ",".join(blocks) if blocks else "all", "name": name,
-            "model": args.model, "cutoffs": args.cutoffs, "n_features": len(feats),
+            "model": args.model, "cutoffs": len(cuts) - 1, "n_features": len(feats),
+            # Без этих двух колонок строка стресс-теста неотличима от штатной,
+            # а сравнивать их между собой нельзя.
+            "val_cutoff": str(cuts[0]),
+            "train_cutoffs": " ".join(str(c) for c in cuts[1:]),
             "rmsle_single": round(res["single"]["rmsle"], 5),
             "rmsle_two_stage": round(res["two_stage"]["rmsle"], 5),
             "rmsle_blend": round(res["blend"]["rmsle"], 5), "blend_w": round(best_w, 2),
@@ -158,10 +180,12 @@ def main() -> None:
         f_clf.save(MODELS / f"{name}_clf.pkl")
         f_reg.save(MODELS / f"{name}_reg.pkl")
         meta["final"] = True
-        print(f"модели сохранены в {MODELS}")
-
-    (MODELS / f"{name}_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"мета: {MODELS / f'{name}_meta.json'}")
+        # Мета пишется только вместе с весами: иначе прогон без --final оставлял бы
+        # рядом со старыми .pkl мету от другого набора признаков.
+        (MODELS / f"{name}_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"модели и мета сохранены в {MODELS}")
+    else:
+        print("прогон без --final: веса не сохранялись, результат — строкой в experiments.csv")
 
 
 if __name__ == "__main__":

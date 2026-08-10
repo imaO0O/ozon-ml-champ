@@ -34,6 +34,16 @@ python src/train.py --cutoffs 6 --final  # + дообучение на всех 
 python src/predict.py --name lgbm      # сабмит в submissions/
 ```
 
+Запускайте через `python -u`, иначе вывод буферизуется и прогресс не виден до
+самого конца прогона.
+
+Вклад своего блока признаков и устойчивость к сдвигу уровня площадки:
+
+```bash
+python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios --note "без моего блока"
+python -u src/train.py --cutoffs 8 --val-cutoff 2025-12-16 --train-cutoffs 2025-06-19,2025-07-19,2025-08-18
+```
+
 Обучение на GPU (у кого есть видеокарта) — та же команда с другим движком:
 
 ```bash

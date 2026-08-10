@@ -35,6 +35,25 @@ def scan_log(path=TRAIN_PARQUET) -> pl.LazyFrame:
     return lf
 
 
+def day_context(hist: pl.LazyFrame) -> pl.LazyFrame:
+    """Суточные итоги площадки — контекст, доступный блокам как обычные колонки.
+
+    Уровень площадки за 2025 год вырос примерно вдвое (GMV на пользователя за
+    30 дней: 58 в январе, 111 в декабре, 84 в январе 2026), поэтому абсолютные
+    рубли пользователя означают разное в разные месяцы. Доля в дневном объёме
+    от уровня не зависит и переносится между режимами.
+
+    Считается только по событиям до cutoff'а (hist уже отфильтрован), так что
+    утечки будущего нет.
+    """
+    return hist.group_by("event_date").agg(
+        pl.col("gmv").sum().alias("day_gmv"),
+        pl.col("to_ord").sum().alias("day_ord"),
+        pl.col("searches").sum().alias("day_searches"),
+        pl.len().alias("day_active_users"),
+    )
+
+
 def build_features(cutoff: dt.date, lf: pl.LazyFrame | None = None,
                    blocks: list[str] | None = None) -> pl.DataFrame:
     """Признаки всех пользователей, у которых есть хоть одно событие до cutoff."""
@@ -45,6 +64,7 @@ def build_features(cutoff: dt.date, lf: pl.LazyFrame | None = None,
             (pl.lit(cutoff) - pl.col("event_date")).dt.total_days().cast(pl.Int32).alias("days_ago")
         )
     )
+    hist = hist.join(day_context(hist), on="event_date", how="left")
     chosen = selected(blocks)
     aggs = [e for b in chosen if b.aggs for e in b.aggs(cutoff)]
     derived = [e for b in chosen if b.derived for e in b.derived()]
@@ -86,3 +106,4 @@ def build_dataset(cutoff: dt.date, with_target: bool = True,
 from . import windows  # noqa: E402,F401  (после определения реестра)
 from . import lifetime  # noqa: E402,F401
 from . import ratios  # noqa: E402,F401
+from . import platform  # noqa: E402,F401

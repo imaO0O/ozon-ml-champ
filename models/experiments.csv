@@ -1,3 +1,6 @@
-created,commit,feat_ver,blocks,name,model,cutoffs,n_features,rmsle_single,rmsle_two_stage,rmsle_blend,blend_w,gini_blend,sum_bias_blend,best_iter_single,note
-2026-08-10T21:01:18,369f7ab+dirty,4e7225b5,all,lgbm,lgbm,6,161,1.68685,1.6851,1.68507,0.9,0.7383,-0.4859,147,"базовая линия: 161 признак, 6 срезов"
-2026-08-10T21:15:41,369f7ab+dirty,4d452069,all,lgbm,lgbm,6,161,1.68643,1.68534,1.6852,0.75,0.738,-0.4879,155,после разбиения признаков на блоки
+created,commit,feat_ver,blocks,name,model,cutoffs,n_features,rmsle_single,rmsle_two_stage,rmsle_blend,blend_w,gini_blend,sum_bias_blend,best_iter_single,note,val_cutoff,train_cutoffs
+2026-08-10T21:01:18,369f7ab+dirty,4e7225b5,all,lgbm,lgbm,6,161,1.68685,1.6851,1.68507,0.9,0.7383,-0.4859,147,"базовая линия: 161 признак, 6 срезов",,
+2026-08-10T21:15:41,369f7ab+dirty,4d452069,all,lgbm,lgbm,6,161,1.68643,1.68534,1.6852,0.75,0.738,-0.4879,155,после разбиения признаков на блоки,,
+2026-08-10T23:19:00,c63998c+dirty,8ebcca93,all,lgbm,lgbm,6,180,1.68612,1.68603,1.68538,0.5,0.7378,-0.4975,140,+ блок platform: доли в дневном GMV площадки,,
+2026-08-10T23:26:26,c63998c+dirty,42e3e39d,"windows,lifetime,ratios",stress_base,lgbm,3,161,1.74971,1.75043,1.74888,0.4,0.7213,-0.5104,565,"стресс-тест уровня: обучение лето, валидация декабрь, без platform",2025-12-16,2025-06-19 2025-07-19 2025-08-18
+2026-08-10T23:29:52,c63998c+dirty,8ebcca93,all,stress_platform,lgbm,3,180,1.75113,1.74701,1.74701,1.0,0.7228,-0.5317,123,"стресс-тест уровня: то же самое, но с блоком platform",2025-12-16,2025-06-19 2025-07-19 2025-08-18
