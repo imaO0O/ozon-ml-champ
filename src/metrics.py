@@ -30,10 +30,15 @@ def gini_norm(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(_gini(y_true, y_pred) / denom) if denom > 0 else 0.0
 
 
-def rmspe_total(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Относительная ошибка суммарного предсказанного GMV по всем клиентам."""
+def sum_bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Смещение суммарного GMV со знаком: <0 — недооценка, >0 — переоценка."""
     t = y_true.sum()
-    return float(abs(np.clip(y_pred, 0, None).sum() - t) / (t + 1e-12))
+    return float((np.clip(y_pred, 0, None).sum() - t) / (t + 1e-12))
+
+
+def rmspe_total(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Модуль относительной ошибки суммарного GMV — tie-breaker жюри."""
+    return abs(sum_bias(y_true, y_pred))
 
 
 def report(y_true: np.ndarray, y_pred: np.ndarray, name: str = "") -> dict:
@@ -41,7 +46,8 @@ def report(y_true: np.ndarray, y_pred: np.ndarray, name: str = "") -> dict:
         "rmsle": rmsle(y_true, y_pred),
         "gini": gini_norm(y_true, y_pred),
         "rmspe_total": rmspe_total(y_true, y_pred),
+        "sum_bias": sum_bias(y_true, y_pred),
     }
     tag = f"{name:>14} | " if name else ""
-    print(f"{tag}RMSLE {m['rmsle']:.5f} | Gini {m['gini']:.4f} | sum-err {m['rmspe_total']:+.2%}")
+    print(f"{tag}RMSLE {m['rmsle']:.5f} | Gini {m['gini']:.4f} | сумма {m['sum_bias']:+.2%}")
     return m
