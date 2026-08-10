@@ -66,8 +66,12 @@ def main() -> None:
     pred_log = (1 - w) * single.predict(X) + w * (clf.predict(X) * reg.predict(X))
     pred = np.clip(np.expm1(np.clip(pred_log, 0, None)), 0, None)
 
-    out = args.out or f"{args.name}_{dt.date.today():%m%d}.csv"
+    # Время в имени обязательно: сабмитов до пяти в день на команду, и файл
+    # без часов-минут молча затирает предыдущий вместе со строкой журнала.
+    out = args.out or f"{args.name}_{dt.datetime.now():%m%d_%H%M}.csv"
     path = SUBMISSIONS / out
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out, чтобы не затереть прошлый сабмит")
     pl.DataFrame({"user_id": user_id, "predict": pred.astype(np.float32)}).write_csv(path)
 
     print(f"\n{path}")
