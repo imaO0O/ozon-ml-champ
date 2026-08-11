@@ -102,6 +102,65 @@ def scale_submission(source: str, alpha: float, out: str | None) -> None:
                 "note": f"зонд размаха: {source}, alpha={alpha:.3f}, Var={p.var():.5f}"})
 
 
+def quad_basis(p: np.ndarray) -> np.ndarray:
+    """Квадратичное направление, очищенное от уже исправленных.
+
+    Сдвиг и растяжение — первые два члена разложения поправки. Третий ловит
+    нелинейную рассогласованность: модель может ошибаться по-разному на слабых
+    и сильных клиентах. Чтобы зонд мерил именно её, направление ортогонализуется
+    к константе и к самому предсказанию — иначе он частично повторил бы уже
+    найденные поправки и сбил бы их.
+    """
+    u = p - p.mean()
+    g = u ** 2
+    g = g - g.mean()                          # ортогонально константе
+    g = g - (g @ u) / (u @ u) * u             # ортогонально линейному члену
+    return g
+
+
+def quad_submission(source: str, gamma: float, out: str | None) -> None:
+    src = SUBMISSIONS / source
+    sub = pl.read_csv(src)
+    p = np.log1p(sub["predict"].to_numpy().astype(np.float64))
+    g = quad_basis(p)
+    shifted = np.clip(np.expm1(np.clip(p + gamma * g, 0, None)), 0, None)
+
+    name = out or f"probe_q{gamma:+.4f}_{dt.datetime.now():%m%d_%H%M}.csv".replace("+", "p")
+    path = SUBMISSIONS / name
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out")
+    pl.DataFrame({"user_id": sub["user_id"], "predict": shifted.astype(np.float32)}).write_csv(path)
+
+    print(f"{path}")
+    print(f"  исходный файл: {source} | gamma = {gamma:+.5f}")
+    print(f"  Var(g) = {g.var():.5f}  <- нужно для решения")
+    print(f"  сдвиг среднего: {(gamma * g).mean():+.2e} (должен быть ~0)")
+    print(f"  обрезано нулём: {(p + gamma * g < 0).mean():.3%}")
+    print(f"  сумма: {np.expm1(p).sum():,.0f} -> {shifted.sum():,.0f}")
+    append_csv(SUBMISSIONS / "log.csv",
+               ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
+                "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"],
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "probe", "model": "quad",
+                "pred_sum": round(float(shifted.sum())),
+                "pred_zeros": f"{(shifted < 1e-6).mean():.4f}",
+                "note": f"зонд кривизны: {source}, gamma={gamma:+.5f}, Var(g)={g.var():.5f}"})
+
+
+def solve_direction(mse0: float, mse1: float, step: float, var_g: float, what: str) -> None:
+    """Общее решение для зонда вдоль любого ортогонализованного направления."""
+    m0, m1 = mse0 ** 2, mse1 ** 2
+    cov = (m0 - m1 + step ** 2 * var_g) / (2 * step)
+    best_step = cov / var_g
+    best = max(m0 - cov ** 2 / var_g, 0.0) ** 0.5
+    print(f"RMSLE базового {mse0:.7f}, зонда — {mse1:.7f}")
+    print(f"\nCov(остаток, {what}) = {cov:+.5f}")
+    print(f"оптимальный коэффициент = {best_step:+.5f}")
+    print(f"ожидаемый RMSLE {best:.7f} (выигрыш {mse0 - best:+.5f})")
+    if mse0 - best < 0.0002:
+        print("\nвывод: в этом направлении поправлять нечего")
+
+
 def solve_scale(mse0: float, mse1: float, alpha: float, var_p: float) -> None:
     """По ответу зонда размаха восстановить оптимальное растяжение."""
     a = alpha - 1.0
@@ -148,6 +207,10 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--alpha", type=float, default=None,
                     help="растяжение вокруг среднего вместо сдвига")
+    ap.add_argument("--gamma", type=float, default=None,
+                    help="коэффициент при квадратичном направлении (ортогонализованном)")
+    ap.add_argument("--var-g", type=float, default=None,
+                    help="Var(g) — печатается при создании квадратичного зонда")
     ap.add_argument("--var-p", type=float, default=None,
                     help="Var(log1p(предсказаний)) — печатается при создании зонда размаха")
     ap.add_argument("--solve", action="store_true", help="решить по двум ответам лидерборда")
@@ -158,12 +221,20 @@ def main() -> None:
     if args.solve:
         if args.mse0 is None or args.mse1 is None:
             raise SystemExit("нужны --mse0 и --mse1")
-        if args.alpha is not None:
+        if args.gamma is not None:
+            if args.var_g is None:
+                raise SystemExit("для квадратичного зонда нужен --var-g")
+            solve_direction(args.mse0, args.mse1, args.gamma, args.var_g, "кривизна")
+        elif args.alpha is not None:
             if args.var_p is None:
                 raise SystemExit("для зонда размаха нужен --var-p")
             solve_scale(args.mse0, args.mse1, args.alpha, args.var_p)
         else:
             solve(args.mse0, args.mse1, args.delta)
+    elif args.gamma is not None:
+        if not args.source:
+            raise SystemExit("нужен --source")
+        quad_submission(args.source, args.gamma, args.out)
     elif args.alpha is not None:
         if not args.source:
             raise SystemExit("нужен --source")
