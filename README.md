@@ -88,6 +88,12 @@ python src/make_fake_data.py --users 8000
 OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.csv python src/train.py --cutoffs 3 --rounds 400 --name smoke --final
 ```
 
+## С чего начать
+
+Новому человеку в проекте: [TASKS.md](TASKS.md) — кто чем занят и что брать
+следующим, затем [PLAN.md](PLAN.md) разделы 2 (как мерить) и 4 (что уже
+проверено и не работает).
+
 ## Работа в команде
 
 Репозиторий **приватный** на время онлайн-этапа: жюри запрашивает его у топ-15 само,
