@@ -8,7 +8,7 @@
 Скачать со страницы соревнования и положить в `data/raw/`:
 
 ```
-data/raw/train.parquet        ~180 МБ, 2025-01-01 .. 2026-02-13
+data/raw/train.parquet        172 МБ, 30 631 006 строк, 2025-01-01 .. 2026-02-13
 data/raw/sample_submit.csv    250 000 user_id
 ```
 
@@ -21,8 +21,28 @@ data/raw/sample_submit.csv    250 000 user_id
 
 ## Установка
 
+PowerShell (Windows) — оператор `&&` в PowerShell 5.1 не работает, поэтому
+командами по очереди:
+
 ```bash
-python -m venv .venv && .venv/Scripts/activate && pip install -r requirements.txt
+python -m venv .venv
+```
+
+```bash
+.venv\Scripts\Activate.ps1
+```
+
+```bash
+pip install -r requirements.txt
+```
+
+Если активация запрещена политикой выполнения, можно не активировать окружение,
+а вызывать интерпретатор напрямую: `.venv\Scripts\python.exe src/train.py ...`
+
+bash / Linux / macOS:
+
+```bash
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 
 ## Запуск
@@ -48,9 +68,12 @@ python -u src/probe_shift.py --source shifted.csv --alpha 1.0545 --out final.csv
 Вклад своего блока признаков и устойчивость к сдвигу уровня площадки:
 
 ```bash
-python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios --note "без моего блока"
+python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios,platform,unit --note "без моего блока"
 python -u src/train.py --cutoffs 8 --val-cutoff 2025-12-16 --train-cutoffs 2025-06-19,2025-07-19,2025-08-18
 ```
+
+Сейчас существуют пять блоков: `windows`, `lifetime`, `ratios`, `platform`,
+`unit`. Полный список всегда виден в подсказке `python src/datasets.py --help`.
 
 Диагностика и калибровка:
 
@@ -81,12 +104,18 @@ LightGBM `device_type=gpu` тоже поддержан, но на Windows тре
 OpenCL — для карт 50-й серии проще CatBoost (`task_type=GPU`) или
 XGBoost (`device=cuda`, нужен билд под CUDA 12.8+).
 
-Прогнать пайплайн без реальных данных (синтетика той же схемы):
+Прогнать пайплайн без реальных данных (синтетика той же схемы). PowerShell:
 
 ```bash
 python src/make_fake_data.py --users 8000
-OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.csv python src/train.py --cutoffs 3 --rounds 400 --name smoke --final
 ```
+
+```bash
+$env:OZON_TRAIN="data/raw/fake_train.parquet"; $env:OZON_SUBMIT="data/raw/fake_sample_submit.csv"; python -u src/train.py --cutoffs 3 --rounds 400 --name smoke --final
+```
+
+В bash то же самое пишется как `OZON_TRAIN=... OZON_SUBMIT=... python ...`
+в одну строку.
 
 ## С чего начать
 
@@ -101,8 +130,12 @@ OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.c
 
 Данных в репозитории нет и не будет: каждый скачивает `train.parquet` и
 `sample_submit.csv` со страницы соревнования себе в `data/raw/`. Кэш признаков
-(`data/processed/`), модели и сабмиты тоже не коммитятся — они пересобираются
-командами из README за пару минут.
+(`data/processed/`), веса моделей и сами csv-файлы сабмитов тоже не коммитятся —
+они пересобираются командами из README за минуты.
+
+**Журналы, наоборот, лежат в git и обязательны:** `models/experiments.csv`,
+`models/tuning.csv`, `models/ensemble.csv`, `submissions/log.csv`. Без них
+результаты команды несравнимы между собой.
 
 Один эксперимент — одна ветка и один PR: так видно, что именно дало прирост,
 и так же это увидит жюри в истории. Каждый сабмит `predict.py` пишет строку в
@@ -132,9 +165,11 @@ OZON_TRAIN=data/raw/fake_train.parquet OZON_SUBMIT=data/raw/fake_sample_submit.c
   `log1p(0) = 0`, поэтому `E[log1p(y)] = p * E[log1p(y) | y > 0]`. Обычно лучше
   ранжирует пользователей (Gini) — это tie-breaker жюри.
 * **blend** — веса подбираются на валидации по RMSLE.
-* **ансамбль** (`--ensemble`) — одноголовая модель заменяется средним пяти
-  разнородных конфигураций LightGBM в log1p-шкале. Отдельные конфигурации-чемпионы
-  между валидационными срезами не переносятся, а среднее выигрывает на обоих.
+* **ансамбль** (`--ensemble`) — одноголовая модель заменяется средним нескольких
+  разнородных конфигураций в log1p-шкале. Состав выбирается флагом `--members`:
+  `lgb` (умолчание, пять конфигураций LightGBM), `cat`, `mixed` (5 LightGBM +
+  2 CatBoost). Отдельные конфигурации-чемпионы между валидационными срезами
+  не переносятся, а среднее выигрывает на обоих.
 * **поправки калибровки** — сдвиг уровня и растяжение размаха, измеренные
   зондированием лидерборда. Применяются к готовому сабмиту, модель не трогают.
 
