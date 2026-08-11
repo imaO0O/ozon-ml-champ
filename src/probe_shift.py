@@ -66,6 +66,62 @@ def shift_submission(source: str, delta: float, out: str | None) -> None:
                 "note": f"зонд уровня: {source} со сдвигом {delta:+.3f} в log1p"})
 
 
+def scale_submission(source: str, alpha: float, out: str | None) -> None:
+    """Растянуть предсказания вокруг их среднего: p' = m + alpha*(p - m).
+
+    Уровень мы уже поправили сдвигом, но размах предсказаний может быть сжат
+    или растянут относительно правды — модель обучалась в другом режиме.
+    Среднее при таком преобразовании не меняется, поэтому найденный сдвиг
+    остаётся оптимальным, а поправки не мешают друг другу.
+    """
+    src = SUBMISSIONS / source
+    sub = pl.read_csv(src)
+    p = np.log1p(sub["predict"].to_numpy().astype(np.float64))
+    m = p.mean()
+    scaled = np.clip(np.expm1(np.clip(m + alpha * (p - m), 0, None)), 0, None)
+
+    name = out or f"probe_a{alpha:.3f}_{dt.datetime.now():%m%d_%H%M}.csv"
+    path = SUBMISSIONS / name
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out")
+    pl.DataFrame({"user_id": sub["user_id"], "predict": scaled.astype(np.float32)}).write_csv(path)
+
+    print(f"{path}")
+    print(f"  исходный файл: {source} | растяжение alpha = {alpha:.3f}")
+    print(f"  Var(p) в log1p-шкале: {p.var():.5f}  <- нужно для решения")
+    print(f"  доля предсказаний, обрезанных нулём после растяжения: "
+          f"{(m + alpha * (p - m) < 0).mean():.3%}")
+    print(f"  сумма: {np.expm1(p).sum():,.0f} -> {scaled.sum():,.0f}")
+    append_csv(SUBMISSIONS / "log.csv",
+               ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
+                "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"],
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "probe", "model": "scale",
+                "pred_sum": round(float(scaled.sum())),
+                "pred_zeros": f"{(scaled < 1e-6).mean():.4f}",
+                "note": f"зонд размаха: {source}, alpha={alpha:.3f}, Var={p.var():.5f}"})
+
+
+def solve_scale(mse0: float, mse1: float, alpha: float, var_p: float) -> None:
+    """По ответу зонда размаха восстановить оптимальное растяжение."""
+    a = alpha - 1.0
+    m0, m1 = mse0 ** 2, mse1 ** 2
+    cov = (m0 - m1 + a ** 2 * var_p) / (2 * a)
+    best_a = cov / var_p
+    gain_mse = cov ** 2 / var_p
+    best = max(m0 - gain_mse, 0.0) ** 0.5
+    print(f"RMSLE базового {mse0:.7f}, зонда с alpha={alpha:.3f} — {mse1:.7f}")
+    print(f"\nCov(остаток, предсказание) = {cov:+.5f}")
+    print(f"оптимальное alpha = {1 + best_a:.4f}")
+    print(f"ожидаемый RMSLE {best:.7f} (выигрыш {mse0 - best:+.5f})")
+    if abs(best_a) < 0.005:
+        print("\nвывод: размах предсказаний уже верный, растягивать нечего")
+    elif best_a > 0:
+        print("\nвывод: предсказания сжаты — правда разбросана сильнее, чем модель считает")
+    else:
+        print("\nвывод: предсказания растянуты — модель переоценивает разброс")
+
+
 def solve(mse0: float, mse1: float, delta: float) -> None:
     """По двум ответам лидерборда восстановить смещение и оптимальный сдвиг."""
     m0, m1 = mse0 ** 2, mse1 ** 2
@@ -90,15 +146,28 @@ def main() -> None:
     ap.add_argument("--source", default=None, help="исходный сабмит из submissions/")
     ap.add_argument("--delta", type=float, default=0.15, help="сдвиг в log1p-шкале")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="растяжение вокруг среднего вместо сдвига")
+    ap.add_argument("--var-p", type=float, default=None,
+                    help="Var(log1p(предсказаний)) — печатается при создании зонда размаха")
     ap.add_argument("--solve", action="store_true", help="решить по двум ответам лидерборда")
     ap.add_argument("--mse0", type=float, help="RMSLE исходного сабмита")
-    ap.add_argument("--mse1", type=float, help="RMSLE сабмита со сдвигом")
+    ap.add_argument("--mse1", type=float, help="RMSLE сабмита-зонда")
     args = ap.parse_args()
 
     if args.solve:
         if args.mse0 is None or args.mse1 is None:
             raise SystemExit("нужны --mse0 и --mse1")
-        solve(args.mse0, args.mse1, args.delta)
+        if args.alpha is not None:
+            if args.var_p is None:
+                raise SystemExit("для зонда размаха нужен --var-p")
+            solve_scale(args.mse0, args.mse1, args.alpha, args.var_p)
+        else:
+            solve(args.mse0, args.mse1, args.delta)
+    elif args.alpha is not None:
+        if not args.source:
+            raise SystemExit("нужен --source")
+        scale_submission(args.source, args.alpha, args.out)
     else:
         if not args.source:
             raise SystemExit("нужен --source")
