@@ -98,12 +98,12 @@ def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, mem
         return m
 
     models = []
-    for name, params in members:
-        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds, params=params)
+    for mname, mkind, params in members:
+        m = GBM(kind=mkind, task="reg", device=device, n_estimators=rounds, params=params)
         m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
-        print(f"  участник {name:<16} итераций {m.best_iter}")
+        print(f"  участник {mname:<20} итераций {m.best_iter}")
         models.append(m)
-    return Ensemble(models, [n for n, _ in members])
+    return Ensemble(models, [n for n, _, _ in members])
 
 
 def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000, w=None):
@@ -248,13 +248,13 @@ def main() -> None:
             fitted = []
             # mname, а не name: в name лежит имя артефактов, и цикл его затирал —
             # модели сохранялись под именем последнего участника.
-            for (mname, params), m in zip(members, single.models):
-                fm = GBM(args.model, "reg", args.device, int(m.best_iter * scale),
+            for (mname, mkind, params), m in zip(members, single.models):
+                fm = GBM(mkind, "reg", args.device, int(m.best_iter * scale),
                          early_stopping=0, params=params)
                 fm.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
-                print(f"  участник {mname:<16} итераций {fm.n_estimators}")
+                print(f"  участник {mname:<20} итераций {fm.n_estimators}")
                 fitted.append(fm)
-            f_single = Ensemble(fitted, [n for n, _ in members])
+            f_single = Ensemble(fitted, [n for n, _, _ in members])
         else:
             f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale),
                            early_stopping=0)
