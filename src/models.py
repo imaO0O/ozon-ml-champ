@@ -75,9 +75,17 @@ class GBM:
         self.model = None
         self.best_iter = n_estimators
 
-    def fit(self, X, y, X_val=None, y_val=None, feature_names=None, sample_weight=None):
+    def fit(self, X, y, X_val=None, y_val=None, feature_names=None, sample_weight=None,
+            init_score=None, init_score_val=None):
         """sample_weight — веса обучающих примеров; валидация всегда без весов,
-        иначе метрика перестанет совпадать с лидербордом."""
+        иначе метрика перестанет совпадать с лидербордом.
+
+        init_score — смещение: модель учит остаток поверх него. Нужно, чтобы
+        уровень пользователя переносился напрямую, а не выучивался деревьями
+        в том диапазоне, который был в обучении. Предсказание возвращается уже
+        без смещения, прибавлять его обратно должен вызывающий код.
+        """
+        self.has_init_score = init_score is not None
         has_val = X_val is not None and self.early_stopping > 0
         if self.kind == "lgbm":
             import lightgbm as lgb
@@ -86,10 +94,12 @@ class GBM:
             base.update(self.params)
             if self.device == "gpu":
                 base["device_type"] = "gpu"
-            dtrain = lgb.Dataset(X, label=y, weight=sample_weight, feature_name=feature_names or "auto")
+            dtrain = lgb.Dataset(X, label=y, weight=sample_weight, init_score=init_score,
+                                 feature_name=feature_names or "auto")
             valid, cbs = [], [lgb.log_evaluation(self.log_period)]
             if has_val:
-                valid = [lgb.Dataset(X_val, label=y_val, reference=dtrain)]
+                valid = [lgb.Dataset(X_val, label=y_val, init_score=init_score_val,
+                                     reference=dtrain)]
                 cbs.append(lgb.early_stopping(self.early_stopping, verbose=False))
             self.model = lgb.train(base, dtrain, num_boost_round=self.n_estimators,
                                    valid_sets=valid, callbacks=cbs)
