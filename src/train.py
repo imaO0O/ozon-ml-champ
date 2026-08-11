@@ -144,6 +144,8 @@ def main() -> None:
                     help="период полураспада веса примера в днях; 0 = все срезы равнозначны")
     ap.add_argument("--ensemble", action="store_true",
                     help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
+    ap.add_argument("--members", default="lgb",
+                    help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -170,8 +172,13 @@ def main() -> None:
 
     members = None
     if args.ensemble:
-        from ensemble import MEMBERS as members  # noqa: PLC0415  (импорт по требованию)
-        print(f"одноголовая модель — ансамбль из {len(members)} конфигураций")
+        from ensemble import MEMBER_SETS  # noqa: PLC0415  (импорт по требованию)
+
+        if args.members not in MEMBER_SETS:
+            raise SystemExit(f"нет состава '{args.members}'; есть: {', '.join(sorted(MEMBER_SETS))}")
+        members = MEMBER_SETS[args.members]
+        print(f"одноголовая модель — ансамбль '{args.members}' из {len(members)} конфигураций: "
+              + ", ".join(n for n, _, _ in members))
 
     single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds,
                         w=sw, members=members)
