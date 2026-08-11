@@ -26,6 +26,42 @@ LGB_REG = dict(
 LGB_BIN = {**LGB_REG, "objective": "binary", "metric": "auc"}
 
 
+class Ensemble:
+    """Среднее нескольких моделей в log1p-шкале — там же, где живёт метрика.
+
+    Интерфейс совпадает с GBM (predict/save/feature_importance), поэтому
+    predict.py не отличает ансамбль от одиночной модели и менять его не нужно.
+
+    Почему усреднение, а не выбор лучшей: конфигурации-победители не переносятся
+    между валидационными срезами (проверено на двух), а среднее выигрывает
+    у рабочего умолчания на обоих.
+    """
+
+    def __init__(self, models: list["GBM"], names: list[str] | None = None):
+        self.models = models
+        self.names = names or [f"m{i}" for i in range(len(models))]
+
+    @property
+    def best_iter(self) -> int:
+        return max(m.best_iter for m in self.models)
+
+    def predict(self, X) -> np.ndarray:
+        return np.mean([m.predict(X) for m in self.models], axis=0)
+
+    def feature_importance(self, names: list[str]) -> list[tuple[str, float]]:
+        total: dict[str, float] = {}
+        for m in self.models:
+            for f, g in m.feature_importance(names):
+                total[f] = total.get(f, 0.0) + g / len(self.models)
+        return sorted(total.items(), key=lambda t: -t[1])
+
+    def save(self, path) -> None:
+        import pickle
+
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+
 class GBM:
     """kind: lgbm | cat | xgb; task: reg | bin; device: cpu | gpu."""
 

@@ -22,7 +22,7 @@ import polars as pl
 from config import CUTOFF_STRIDE, HORIZON, MODELS, SEED, train_cutoffs
 from datasets import feature_names, features_version, get_dataset, parse_blocks
 from metrics import report, rmse_log
-from models import GBM
+from models import GBM, Ensemble
 from utils import append_csv, git_commit
 
 
@@ -86,10 +86,24 @@ def recency_weights(train: pl.DataFrame, halflife: float) -> np.ndarray | None:
     return (0.5 ** (gap / halflife)).astype(np.float32)
 
 
-def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None):
-    m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
-    m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
-    return m
+def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None):
+    """Одна модель или ансамбль разнородных конфигураций (см. ensemble.py).
+
+    Ансамбль выигрывает у рабочего умолчания на обоих валидационных срезах,
+    тогда как отдельные конфигурации-чемпионы между срезами не переносятся.
+    """
+    if not members:
+        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
+        m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
+        return m
+
+    models = []
+    for name, params in members:
+        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds, params=params)
+        m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
+        print(f"  участник {name:<16} итераций {m.best_iter}")
+        models.append(m)
+    return Ensemble(models, [n for n, _ in members])
 
 
 def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000, w=None):
@@ -128,6 +142,8 @@ def main() -> None:
                     help="подмножество блоков признаков через запятую (ablation)")
     ap.add_argument("--halflife", type=float, default=0,
                     help="период полураспада веса примера в днях; 0 = все срезы равнозначны")
+    ap.add_argument("--ensemble", action="store_true",
+                    help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -152,7 +168,13 @@ def main() -> None:
             args.halflife,
             ", ".join(f"{g}дн={0.5 ** (g / args.halflife):.2f}" for g in gaps)))
 
-    single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds, w=sw)
+    members = None
+    if args.ensemble:
+        from ensemble import MEMBERS as members  # noqa: PLC0415  (импорт по требованию)
+        print(f"одноголовая модель — ансамбль из {len(members)} конфигураций")
+
+    single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds,
+                        w=sw, members=members)
     p_single = single.predict(Xva)
     clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds, w=sw)
     p_two = two_stage_predict(clf, reg, Xva)
@@ -220,8 +242,23 @@ def main() -> None:
         sw_all = None if sw is None else np.concatenate([sw, np.ones(len(yva), dtype=np.float32)])
         print(f"\n--- финальное обучение на всех {len(cuts)} cutoff'ах (итераций x{scale:.2f}) ---")
 
-        f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale), early_stopping=0)
-        f_single.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
+        if members:
+            # Каждый участник дообучается со своим числом итераций: они сильно
+            # разные (77 у быстрого lr=0.05 против 207 у медленного lr=0.02).
+            fitted = []
+            # mname, а не name: в name лежит имя артефактов, и цикл его затирал —
+            # модели сохранялись под именем последнего участника.
+            for (mname, params), m in zip(members, single.models):
+                fm = GBM(args.model, "reg", args.device, int(m.best_iter * scale),
+                         early_stopping=0, params=params)
+                fm.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
+                print(f"  участник {mname:<16} итераций {fm.n_estimators}")
+                fitted.append(fm)
+            f_single = Ensemble(fitted, [n for n, _ in members])
+        else:
+            f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale),
+                           early_stopping=0)
+            f_single.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
         f_clf = GBM(args.model, "bin", args.device, int(clf.best_iter * scale), early_stopping=0)
         f_clf.fit(Xall, (yall > 0).astype(np.int8), feature_names=feats, sample_weight=sw_all)
         pos = yall > 0
