@@ -30,9 +30,11 @@ class GBM:
     """kind: lgbm | cat | xgb; task: reg | bin; device: cpu | gpu."""
 
     def __init__(self, kind: str = "lgbm", task: str = "reg", device: str = "cpu",
-                 n_estimators: int = 6000, early_stopping: int = 200, params: dict | None = None):
+                 n_estimators: int = 6000, early_stopping: int = 200, params: dict | None = None,
+                 log_period: int = 200):
         self.kind, self.task, self.device = kind, task, device
         self.n_estimators, self.early_stopping = n_estimators, early_stopping
+        self.log_period = log_period  # 0 — молча, нужно при переборе гиперпараметров
         self.params = dict(params or {})
         self.model = None
         self.best_iter = n_estimators
@@ -49,7 +51,7 @@ class GBM:
             if self.device == "gpu":
                 base["device_type"] = "gpu"
             dtrain = lgb.Dataset(X, label=y, weight=sample_weight, feature_name=feature_names or "auto")
-            valid, cbs = [], [lgb.log_evaluation(200)]
+            valid, cbs = [], [lgb.log_evaluation(self.log_period)]
             if has_val:
                 valid = [lgb.Dataset(X_val, label=y_val, reference=dtrain)]
                 cbs.append(lgb.early_stopping(self.early_stopping, verbose=False))
