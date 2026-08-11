@@ -37,7 +37,9 @@ class GBM:
         self.model = None
         self.best_iter = n_estimators
 
-    def fit(self, X, y, X_val=None, y_val=None, feature_names=None):
+    def fit(self, X, y, X_val=None, y_val=None, feature_names=None, sample_weight=None):
+        """sample_weight — веса обучающих примеров; валидация всегда без весов,
+        иначе метрика перестанет совпадать с лидербордом."""
         has_val = X_val is not None and self.early_stopping > 0
         if self.kind == "lgbm":
             import lightgbm as lgb
@@ -46,7 +48,7 @@ class GBM:
             base.update(self.params)
             if self.device == "gpu":
                 base["device_type"] = "gpu"
-            dtrain = lgb.Dataset(X, label=y, feature_name=feature_names or "auto")
+            dtrain = lgb.Dataset(X, label=y, weight=sample_weight, feature_name=feature_names or "auto")
             valid, cbs = [], [lgb.log_evaluation(200)]
             if has_val:
                 valid = [lgb.Dataset(X_val, label=y_val, reference=dtrain)]
@@ -68,7 +70,8 @@ class GBM:
             if self.task == "reg":
                 kw.setdefault("loss_function", "RMSE")
             self.model = Model(**kw)
-            self.model.fit(X, y, eval_set=(X_val, y_val) if has_val else None)
+            self.model.fit(X, y, sample_weight=sample_weight,
+                           eval_set=(X_val, y_val) if has_val else None)
             self.best_iter = int(self.model.get_best_iteration() or self.n_estimators) + 1
 
         elif self.kind == "xgb":
@@ -84,7 +87,8 @@ class GBM:
             kw.update(self.params)
             Model = xgb.XGBClassifier if self.task == "bin" else xgb.XGBRegressor
             self.model = Model(**kw)
-            self.model.fit(X, y, eval_set=[(X_val, y_val)] if has_val else None, verbose=200)
+            self.model.fit(X, y, sample_weight=sample_weight,
+                           eval_set=[(X_val, y_val)] if has_val else None, verbose=200)
             self.best_iter = int(getattr(self.model, "best_iteration", self.n_estimators) or self.n_estimators) + 1
         else:
             raise ValueError(f"unknown kind: {self.kind}")

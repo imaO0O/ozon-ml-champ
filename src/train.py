@@ -54,7 +54,14 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks)
     trains = [get_dataset(c, rebuild=rebuild, blocks=blocks) for c in train_cuts]
     feats = feature_names(val)
-    trains = [t.select(["user_id", *feats, "target"]) for t in trains]
+    # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
+    # feats берётся из колонок val, поэтому в X эта колонка не попадёт.
+    trains = [
+        t.select(["user_id", *feats, "target"]).with_columns(
+            pl.lit((val_cut - c).days).cast(pl.Int32).alias("_gap")
+        )
+        for c, t in zip(train_cuts, trains)
+    ]
     train = pl.concat(trains, how="vertical")
     print(f"train: {train.height:,} строк ({len(train_cuts)} cutoff) | val: {val.height:,} ({val_cut})")
     return train, val, feats, cuts
@@ -66,19 +73,34 @@ def to_xy(df: pl.DataFrame, feats: list[str]):
     return X, y
 
 
-def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000):
+def recency_weights(train: pl.DataFrame, halflife: float) -> np.ndarray | None:
+    """Вес примера падает вдвое на каждые `halflife` дней удаления от валидации.
+
+    Два независимых опыта показали, что свежесть среза здесь дороже количества
+    примеров: возврат среза, который ближе на 12 дней, дал больше, чем миллион
+    дополнительных строк. Веса — прямая проверка этого наблюдения.
+    """
+    if not halflife:
+        return None
+    gap = train["_gap"].to_numpy().astype(np.float64)
+    return (0.5 ** (gap / halflife)).astype(np.float32)
+
+
+def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None):
     m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
-    m.fit(X, ylog, Xv, yvlog, feature_names=feats)
+    m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
     return m
 
 
-def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000):
+def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000, w=None):
     clf = GBM(kind=kind, task="bin", device=device, n_estimators=rounds)
-    clf.fit(X, (y > 0).astype(np.int8), Xv, (yv > 0).astype(np.int8), feature_names=feats)
+    clf.fit(X, (y > 0).astype(np.int8), Xv, (yv > 0).astype(np.int8),
+            feature_names=feats, sample_weight=w)
 
     pos, posv = y > 0, yv > 0
     reg = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
-    reg.fit(X[pos], np.log1p(y[pos]), Xv[posv], np.log1p(yv[posv]), feature_names=feats)
+    reg.fit(X[pos], np.log1p(y[pos]), Xv[posv], np.log1p(yv[posv]),
+            feature_names=feats, sample_weight=w[pos] if w is not None else None)
     return clf, reg
 
 
@@ -104,6 +126,8 @@ def main() -> None:
                     help="явный список обучающих срезов через запятую, ГГГГ-ММ-ДД")
     ap.add_argument("--blocks", default=None,
                     help="подмножество блоков признаков через запятую (ablation)")
+    ap.add_argument("--halflife", type=float, default=0,
+                    help="период полураспада веса примера в днях; 0 = все срезы равнозначны")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -119,9 +143,18 @@ def main() -> None:
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
     print(f"признаков: {len(feats)} | доля покупателей в val: {(yva > 0).mean():.3%}")
 
-    single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds)
+    # sw, а не w: ниже `w` занято весом бленда, и одноимённая переменная
+    # молча затёрла бы веса примеров перед финальным обучением.
+    sw = recency_weights(train, args.halflife)
+    if sw is not None:
+        gaps = sorted(set(train["_gap"].to_list()))
+        print("веса срезов (полураспад %g дн.): %s" % (
+            args.halflife,
+            ", ".join(f"{g}дн={0.5 ** (g / args.halflife):.2f}" for g in gaps)))
+
+    single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds, w=sw)
     p_single = single.predict(Xva)
-    clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds)
+    clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds, w=sw)
     p_two = two_stage_predict(clf, reg, Xva)
 
     print("\n--- валидация (cutoff %s) ---" % cuts[0])
@@ -155,7 +188,7 @@ def main() -> None:
         MODELS / "experiments.csv",
         ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
          "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
-         "gini_blend", "sum_bias_blend", "best_iter_single", "stride", "val_cutoff",
+         "gini_blend", "sum_bias_blend", "best_iter_single", "stride", "halflife", "val_cutoff",
          "train_cutoffs", "note"],
         {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
@@ -165,6 +198,7 @@ def main() -> None:
             # Без этих двух колонок строка стресс-теста неотличима от штатной,
             # а сравнивать их между собой нельзя.
             "stride": args.stride or CUTOFF_STRIDE,
+            "halflife": args.halflife or "",
             "val_cutoff": str(cuts[0]),
             "train_cutoffs": " ".join(str(c) for c in cuts[1:]),
             "rmsle_single": round(res["single"]["rmsle"], 5),
@@ -182,15 +216,18 @@ def main() -> None:
         Xall = np.vstack([Xtr, Xva])
         yall = np.concatenate([ytr, yva])
         yall_log = np.log1p(yall)
+        # Валидационный срез в финальном обучении — самый свежий, вес 1.
+        sw_all = None if sw is None else np.concatenate([sw, np.ones(len(yva), dtype=np.float32)])
         print(f"\n--- финальное обучение на всех {len(cuts)} cutoff'ах (итераций x{scale:.2f}) ---")
 
         f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale), early_stopping=0)
-        f_single.fit(Xall, yall_log, feature_names=feats)
+        f_single.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
         f_clf = GBM(args.model, "bin", args.device, int(clf.best_iter * scale), early_stopping=0)
-        f_clf.fit(Xall, (yall > 0).astype(np.int8), feature_names=feats)
+        f_clf.fit(Xall, (yall > 0).astype(np.int8), feature_names=feats, sample_weight=sw_all)
         pos = yall > 0
         f_reg = GBM(args.model, "reg", args.device, int(reg.best_iter * scale), early_stopping=0)
-        f_reg.fit(Xall[pos], yall_log[pos], feature_names=feats)
+        f_reg.fit(Xall[pos], yall_log[pos], feature_names=feats,
+                  sample_weight=None if sw_all is None else sw_all[pos])
 
         f_single.save(MODELS / f"{name}_single.pkl")
         f_clf.save(MODELS / f"{name}_clf.pkl")
