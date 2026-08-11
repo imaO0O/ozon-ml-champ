@@ -12,6 +12,9 @@ models/*
 submissions/*
 !submissions/log.csv
 
+# CatBoost пишет логи обучения в рабочую папку
+catboost_info/
+
 .claude/
 .ipynb_checkpoints/
 .idea/
