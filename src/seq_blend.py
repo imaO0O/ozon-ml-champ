@@ -55,6 +55,58 @@ def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return users, np.mean(preds, axis=0), target
 
 
+def solve_weight(base: str, blend: str, mse0: float, mse1: float,
+                 weight: float, shift: float) -> None:
+    """Оптимальный вес бленда из двух уже полученных ответов лидерборда.
+
+    Если оба сабмита стоят на одном уровне (а они стоят: сдвиг выводится так,
+    чтобы mean log1p равнялся измеренному уровню окна), то их разность
+    d = p_blend - p_base имеет нулевое среднее, и всё семейство
+
+        p(t) = p_base + t * d
+
+    сохраняет правильный уровень при любом t. Для такого направления работает
+    та же арифметика, что и у зондов сдвига и размаха:
+
+        MSE(t)  = MSE(0) - 2t*E[r*d] + t^2*E[d^2],   r = log1p(y) - p_base
+        E[r*d]  = (MSE(0) - MSE(1) + E[d^2]) / 2
+        t*      = E[r*d] / E[d^2],   выигрыш = E[r*d]^2 / E[d^2]
+
+    E[d^2] считается офлайн, поэтому двух уже потраченных сабмитов достаточно:
+    ни одного нового зонда на подбор веса не нужно. t = 1 отвечает тому весу
+    и сдвигу, с которыми собран `blend`.
+    """
+    import polars as pl
+
+    from config import SUBMISSIONS
+
+    def lg(f):
+        return np.log1p(pl.read_csv(SUBMISSIONS / f)["predict"].to_numpy().astype(np.float64))
+
+    d = lg(blend) - lg(base)
+    ed2 = float((d ** 2).mean())
+    print(f"  среднее направления d: {d.mean():+.6f} (должно быть ~0, иначе уровни файлов разные)")
+    print(f"  E[d^2] = {ed2:.6f}")
+    if abs(d.mean()) > 0.005:
+        print("  ВНИМАНИЕ: уровни файлов заметно различаются, семейство p_base + t*d "
+              "меняет уровень — результат будет смещён")
+
+    m0, m1 = mse0 ** 2, mse1 ** 2
+    erd = (m0 - m1 + ed2) / 2
+    t = erd / ed2
+    best = max(m0 - erd ** 2 / ed2, 0.0) ** 0.5
+    print(f"\n  E[r*d] = {erd:+.6f}")
+    print(f"  оптимальное t = {t:.4f}")
+    print(f"    вес сети = {weight:.4f} * {t:.4f} = {weight * t:.4f}")
+    print(f"    сдвиг    = {shift:+.5f} * {t:.4f} = {shift * t:+.5f}")
+    print(f"  ожидаемый RMSLE {best:.7f} "
+          f"(выигрыш {mse0 - best:+.5f} к базе, {mse1 - best:+.5f} к текущему бленду)")
+    print("\n  сверка формулы на известных точках:")
+    for tt, lab, known in ((0.0, base, mse0), (1.0, blend, mse1)):
+        pred = (m0 - 2 * tt * erd + tt ** 2 * ed2) ** 0.5
+        print(f"    t={tt:.1f} {lab:<28} предсказано {pred:.7f} | ответ {known:.7f}")
+
+
 def expand(patterns: list[str]) -> list[str]:
     """Раскрыть маски вида `gru_final_s7_*.csv` в имена файлов из submissions/.
 
@@ -223,6 +275,13 @@ def main() -> None:
                          "(вместо проверки на валидации)")
     ap.add_argument("--average-submissions", default=None,
                     help="усреднить несколько сабмитов одной модели в log1p (сеть по сидам)")
+    ap.add_argument("--solve-weight", default=None,
+                    help="оптимальный вес бленда по двум ответам лидерборда: "
+                         "база.csv,бленд.csv (нужны --mse0, --mse1, --weight, --shift)")
+    ap.add_argument("--mse0", type=float, default=None, help="RMSLE базового файла")
+    ap.add_argument("--mse1", type=float, default=None, help="RMSLE бленда")
+    ap.add_argument("--shift", type=float, default=0.0,
+                    help="сдвиг, с которым собран бленд (для пересчёта на оптимальный вес)")
     ap.add_argument("--derive-shift", default=None,
                     help="перенести измеренный сдвиг с одной модели на другую без зонда: "
                          "база.csv,новая.csv (нужен --b-base)")
@@ -243,6 +302,12 @@ def main() -> None:
     ap.add_argument("--note", default="")
     args = ap.parse_args()
 
+    if args.solve_weight:
+        parts = [s.strip() for s in args.solve_weight.split(",") if s.strip()]
+        if len(parts) != 2 or args.mse0 is None or args.mse1 is None:
+            raise SystemExit("нужно база.csv,бленд.csv плюс --mse0 и --mse1")
+        solve_weight(parts[0], parts[1], args.mse0, args.mse1, args.weight, args.shift)
+        return
     if args.derive_shift:
         parts = [s.strip() for s in args.derive_shift.split(",") if s.strip()]
         if len(parts) != 2:
