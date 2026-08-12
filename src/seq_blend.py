@@ -62,6 +62,10 @@ def main() -> None:
     ap.add_argument("--val-cutoff", default="2026-01-15")
     ap.add_argument("--cutoffs", type=int, default=6)
     ap.add_argument("--rounds", type=int, default=20000)
+    ap.add_argument("--full", action="store_true",
+                    help="сравнивать не с одиночным LightGBM, а с рабочей моделью целиком: "
+                         "ансамбль пяти конфигураций + двухголовая + их бленд. Это то, из "
+                         "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
     val_cut = dt.date.fromisoformat(args.val_cutoff)
@@ -76,9 +80,32 @@ def main() -> None:
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     del train
-    m = GBM("lgbm", "reg", "cpu", n_estimators=args.rounds, early_stopping=200)
-    m.fit(Xtr, np.log1p(ytr), Xva, np.log1p(yva), feature_names=feats)
-    p_gbm = m.predict(Xva)
+    ylog_tr = np.log1p(ytr)
+    if args.full:
+        # Рабочая модель целиком, теми же функциями, что и train.py — иначе
+        # сравнение шло бы с одиночным LightGBM, а сабмит собирается не из него.
+        from ensemble import MEMBERS
+        from train import fit_single, fit_two_stage, two_stage_predict
+
+        single = fit_single(Xtr, ylog_tr, Xva, np.log1p(yva), feats, "lgbm", "cpu",
+                            args.rounds, members=MEMBERS)
+        p_s = single.predict(Xva)
+        clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, "lgbm", "cpu", args.rounds)
+        p_t = two_stage_predict(clf, reg, Xva)
+        gbm_w, gbm_r = 0.0, float("inf")
+        for w in np.linspace(0, 1, 21):
+            r = rmse_log(np.log1p(yva), w * p_t + (1 - w) * p_s)
+            if r < gbm_r:
+                gbm_w, gbm_r = float(w), r
+        p_gbm = gbm_w * p_t + (1 - gbm_w) * p_s
+        best_iter = single.best_iter
+        print(f"  рабочая модель: ансамбль {len(MEMBERS)} конфигураций + двухголовая, "
+              f"вес двухголовой {gbm_w:.2f}")
+    else:
+        m = GBM("lgbm", "reg", "cpu", n_estimators=args.rounds, early_stopping=200)
+        m.fit(Xtr, ylog_tr, Xva, np.log1p(yva), feature_names=feats)
+        p_gbm = m.predict(Xva)
+        best_iter = m.best_iter
 
     # Выравнивание по user_id: порядок строк выборки признаков не совпадает
     # с порядком в .npz, а складывать предсказания разных пользователей —
@@ -103,7 +130,8 @@ def main() -> None:
             best_w, best_r = float(w), r
 
     print(f"\n=== итог на {val_cut}, {len(yva):,} пользователей ===")
-    print(f"  бустинг            RMSLE {r_gbm:.5f}")
+    print(f"  бустинг ({'рабочая модель' if args.full else 'одиночный LightGBM'})"
+          f"{'' if args.full else '  '}  RMSLE {r_gbm:.5f}")
     print(f"  сеть               RMSLE {r_seq:.5f}")
     print(f"  корреляция предсказаний в log1p-шкале: {corr:.4f}")
     print(f"  лучший бленд       RMSLE {best_r:.5f} при весе сети {best_w:.2f}")
@@ -126,11 +154,12 @@ def main() -> None:
         "model": "blend", "cutoffs": len(cuts) - 1, "n_features": len(feats),
         "rmsle_single": round(r_gbm, 5), "rmsle_two_stage": round(r_seq, 5),
         "rmsle_blend": round(best_r, 5), "blend_w": round(best_w, 2),
-        "gini_blend": "", "sum_bias_blend": "", "best_iter_single": m.best_iter,
+        "gini_blend": "", "sum_bias_blend": "", "best_iter_single": best_iter,
         "stride": 30, "halflife": "", "val_cutoff": str(val_cut),
         "train_cutoffs": " ".join(str(c) for c in cuts[1:]),
-        "note": (args.note or f"бленд сети и LightGBM: corr={corr:.4f}, "
-                              f"выигрыш к лучшему {gain:+.5f}")
+        "note": (args.note or f"бленд сети и бустинга "
+                              f"({'рабочая модель' if args.full else 'одиночный LightGBM'}): "
+                              f"corr={corr:.4f}, выигрыш к лучшему {gain:+.5f}")
                 + f" [колонки: single=бустинг, two_stage=сеть]",
     })
 
