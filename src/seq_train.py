@@ -419,9 +419,14 @@ def main() -> None:
                          "две случайные половины валидации расходятся на 0.007 RMSLE, "
                          "поэтому такое число нельзя сравнивать ни с чем")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--no-amp", action="store_true",
-                    help="считать в float32 вместо bfloat16: у bf16 8 бит мантиссы, "
-                         "а рекуррентная сеть накапливает через них 180 шагов")
+    # Умолчание зависит от архитектуры: измерено, что bf16 стоит рекуррентной
+    # сети 0.007 RMSLE (1.68979 против 1.68266 на январе), а трансформеру
+    # накапливать нечего — у него нет последовательной зависимости по шагам.
+    ap.add_argument("--amp", dest="amp", action="store_true", default=None,
+                    help="считать в bfloat16 (умолчание для transformer)")
+    ap.add_argument("--no-amp", dest="amp", action="store_false",
+                    help="считать в float32 (умолчание для gru/lstm): у bf16 8 бит "
+                         "мантиссы, а рекуррентная сеть протаскивает через них 180 шагов")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--name", default="seq")
     ap.add_argument("--note", default="")
@@ -433,11 +438,15 @@ def main() -> None:
     args = ap.parse_args()
 
     global _AMP
-    _AMP = not args.no_amp
+    if args.amp is None:
+        args.amp = args.arch == "transformer"
+    _AMP = args.amp
     device = torch.device(args.device)
+    precision = "bf16" if _AMP and device.type == "cuda" else "fp32"
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)} | "
-              f"{torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} ГБ")
+              f"{torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} ГБ | "
+              f"точность {precision}")
 
     seq, users, first_day, _ = open_seq()
     parse_date = dt.date.fromisoformat
@@ -511,10 +520,15 @@ def main() -> None:
         # Отметка о подвыборке обязательна: строка с урезанным обучением или
         # урезанной валидацией стоит в журнале рядом с полными и без пометки
         # была бы неотличима от них.
+        # Устройство и точность — в примечании обязательно: в общем журнале нет
+        # своей колонки под них, а bf16 против fp32 стоит 0.007 RMSLE, то есть
+        # две строки без такой пометки выглядели бы одинаково и были бы
+        # несравнимы (то же касается CPU против GPU у бустингов).
         "note": ((f"ПОДВЫБОРКА train={args.subsample or 'полн'} "
                   f"val={args.val_subsample or 'полн'}; " if args.subsample or args.val_subsample else "")
                  + (args.note or f"{args.arch} hidden={args.hidden} layers={args.layers} "
-                                 f"lookback={args.lookback} bs={args.batch_size} lr={args.lr}")),
+                                 f"lookback={args.lookback} bs={args.batch_size} lr={args.lr}")
+                 + f" [{device.type}/{precision} seed={args.seed}]"),
     })
 
     if not args.final:
