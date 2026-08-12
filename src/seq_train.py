@@ -164,6 +164,30 @@ def targets_for(cutoff: dt.date, users: np.ndarray, first_day: np.ndarray):
     return rows, y[rows]
 
 
+def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """Предсказание бустинга из seq_oof, выровненное по строкам матрицы.
+
+    В режиме остатка сеть учит `log1p(y) - base`, поэтому её выход по построению
+    ортогонален тому, что бустинг уже умеет: параллельным направлением он быть
+    не может, а именно эта параллельность и упёрлась в потолок.
+    """
+    path = MODELS / f"{name}_{tag}.npz"
+    if not path.exists():
+        raise SystemExit(f"нет {path.name} — сначала посчитайте: "
+                         f"python -u src/seq_oof.py --name {name}")
+    d = np.load(path)
+    order = np.argsort(d["user_id"])
+    su, sp = d["user_id"][order], d["pred_log"][order]
+    want = users[rows]
+    pos = np.clip(np.searchsorted(su, want), 0, len(su) - 1)
+    ok = su[pos] == want
+    out = np.zeros(len(want), dtype=np.float64)
+    out[ok] = sp[pos[ok]]
+    if (~ok).sum():
+        print(f"  {path.name}: нет предсказания для {(~ok).sum():,} пользователей — беру ноль")
+    return out
+
+
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
                   sample: int = 20000, seed: int = SEED, bin_days: int = 1):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
@@ -293,7 +317,8 @@ def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
 
 
 def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, args,
-                mean, std, device, epochs: int | None = None):
+                mean, std, device, epochs: int | None = None,
+                train_base=None, val_base=None):
     """Обучение с ранней остановкой по валидации; возвращает (модель, эпохи, история).
 
     Если `val_rows` пуст — это финальное дообучение: остановка по числу эпох,
@@ -328,7 +353,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
         # это и локальность memmap, и корректные окна (у срезов разные границы).
         for ci in rng.permutation(len(train_cuts)):
             cut, rows, y = train_cuts[ci], train_rows[ci], train_y[ci]
-            ylog = np.log1p(y)
+            # В режиме остатка целью становится то, чего бустингу не хватило.
+            ylog = np.log1p(y) if train_base is None else np.log1p(y) - train_base[ci]
             for x, yb, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
                                     ylog, shuffle=True, rng=rng, bin_days=args.bin):
                 xb = to_device(x, mean, std, device)
@@ -352,6 +378,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                          mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация",
                          bin_days=args.bin)
+            if val_base is not None:
+                p = val_base + p          # метрика считается по полному предсказанию
             score = rmse_log(np.log1p(val_y), p)
             history.append(score)
             mark = ""
@@ -404,6 +432,12 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
         p_log[~known] = predict_empty(model, args, mean, std, device)
+    if args.residual:
+        # Тот же объект, что и в обучении: бустинг, обученный на всех срезах.
+        base = load_base(args.residual, "test", users, rows)
+        print(f"  остаток добавляется к бустингу: mean base {base.mean():.4f}, "
+              f"mean остатка {p_log.mean():+.4f}")
+        p_log = base + p_log
     pred = np.clip(np.expm1(np.clip(p_log, 0, None)), 0, None)
 
     out = args.out or f"{args.name}_{dt.datetime.now():%m%d_%H%M}.csv"
@@ -477,6 +511,9 @@ def main() -> None:
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val и собрать сабмит")
     ap.add_argument("--out", default=None, help="имя файла сабмита")
+    ap.add_argument("--residual", default=None,
+                    help="учить остаток бустинга: имя набора из seq_oof.py (например oof). "
+                         "Выход сети по построению ортогонален тому, что бустинг уже умеет")
     ap.add_argument("--save-val-pred", action="store_true",
                     help="сохранить предсказания на валидации для бленда с бустингом")
     args = ap.parse_args()
@@ -536,6 +573,17 @@ def main() -> None:
     print(f"  валидация {val_cut}: {len(val_rows):,} пользователей | "
           f"покупателей {(val_y > 0).mean():.2%}")
 
+    train_base = val_base = None
+    if args.residual:
+        print(f"режим остатка: цель = log1p(y) - предсказание бустинга ({args.residual})")
+        train_base = [load_base(args.residual, c.isoformat(), users, r)
+                      for c, r in zip(train_cuts, train_rows)]
+        val_base = load_base(args.residual, val_cut.isoformat(), users, val_rows)
+        base_rmsle = rmse_log(np.log1p(val_y), val_base)
+        print(f"  бустинг на валидации сам по себе: RMSLE {base_rmsle:.5f}")
+        print(f"  остаток: среднее {(np.log1p(val_y) - val_base).mean():+.4f} | "
+              f"std {(np.log1p(val_y) - val_base).std():.4f}")
+
     t0 = time.time()
     print("считаю масштаб каналов по выборке обучающих окон...", flush=True)
     mean_np, std_np = channel_stats(seq, train_rows[0], train_cuts[0], args.lookback,
@@ -545,12 +593,17 @@ def main() -> None:
     std = torch.from_numpy(std_np).to(device)
 
     model, best_epoch, _ = train_model(seq, train_rows, train_y, train_cuts,
-                                       val_rows, val_y, val_cut, args, mean, std, device)
+                                       val_rows, val_y, val_cut, args, mean, std, device,
+                                       train_base=train_base, val_base=val_base)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                      mean, std, device, bin_days=args.bin)
     print(f"\n--- валидация (cutoff {val_cut}) ---")
-    res = report(val_y, np.expm1(np.clip(p_log, 0, None)), args.arch)
+    if val_base is not None:
+        report(val_y, np.expm1(np.clip(val_base, 0, None)), "бустинг")
+        p_log = val_base + p_log
+    res = report(val_y, np.expm1(np.clip(p_log, 0, None)),
+                 args.arch + ("+бустинг" if val_base is not None else ""))
 
     if args.save_val_pred:
         np.savez(MODELS / f"{args.name}_valpred_{val_cut}.npz",
@@ -596,9 +649,10 @@ def main() -> None:
     all_cuts = [*train_cuts, val_cut]
     all_rows = [*train_rows, val_rows]
     all_y = [*train_y, val_y]
+    all_base = None if train_base is None else [*train_base, val_base]
     final, _, _ = train_model(seq, all_rows, all_y, all_cuts, np.array([], dtype=int),
                               np.array([]), val_cut, args, mean, std, device,
-                              epochs=best_epoch)
+                              epochs=best_epoch, train_base=all_base)
 
     ckpt = MODELS / f"{args.name}_{args.arch}.pt"
     torch.save({"state_dict": final.state_dict(), "mean": mean_np, "std": std_np,
