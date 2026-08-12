@@ -55,6 +55,49 @@ def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return users, np.mean(preds, axis=0), target
 
 
+def derive_shift(base: str, new: str, b_base: float) -> None:
+    """Перенести измеренный зондом сдвиг с одной модели на другую — без зонда.
+
+    Сдвиг это среднее остатка: b = E[log1p(y)] - E[log1p(p)]. Первое слагаемое
+    зависит только от тестового окна и одинаково для всех моделей, поэтому
+
+        E[log1p(y)] = mean log1p(p_base) + b_base
+        b_new       = E[log1p(y)] - mean log1p(p_new)
+
+    Равенство точное. Один зонд, потраченный когда-то на одну модель, задаёт
+    уровень тестового окна раз и навсегда — новой модели свой зонд уровня
+    больше не нужен, нужен только зонд размаха.
+
+    Осторожно: b_base должен относиться именно к файлу `base`. Если зонд мерили
+    на другой сборке той же модели, добавляется неточность порядка разницы
+    средних между сборками.
+    """
+    import polars as pl
+
+    from config import SUBMISSIONS
+
+    logs = {}
+    for tag, f in (("база", base), ("новая", new)):
+        p = np.log1p(pl.read_csv(SUBMISSIONS / f)["predict"].to_numpy().astype(np.float64))
+        logs[tag] = p
+        print(f"  {tag:<7} {f:<32} mean log1p {p.mean():.5f} | var {p.var():.5f}")
+
+    y_mean = logs["база"].mean() + b_base
+    b_new = y_mean - logs["новая"].mean()
+    print(f"\n  уровень тестового окна E[log1p(y)] = {logs['база'].mean():.5f} "
+          f"{b_base:+.4f} = {y_mean:.5f}")
+    print(f"  оптимальный сдвиг для новой модели: {b_new:+.5f}")
+    print(f"  ожидаемый выигрыш от него: {b_new ** 2:.5f} в шкале MSE")
+    if abs(b_new) < 0.02:
+        print("\n  вывод: уровень новой модели уже верный, сдвигать почти нечего")
+    else:
+        print(f"\n  применить: python -u src/probe_shift.py --source {new} "
+              f"--delta {b_new:.4f} --out <имя>.csv")
+    print("\n  Растяжение так не переносится: оптимальное alpha = 1 + Cov(остаток, p)/Var(p),")
+    print(f"  а Cov без ответа лидерборда не восстановить. Отношение дисперсий "
+          f"новая/база = {logs['новая'].var() / logs['база'].var():.4f}.")
+
+
 def average_submissions(sources: list[str], out: str | None) -> None:
     """Усреднить несколько сабмитов одной модели в log1p-шкале (сеть по сидам).
 
@@ -151,6 +194,11 @@ def main() -> None:
                          "(вместо проверки на валидации)")
     ap.add_argument("--average-submissions", default=None,
                     help="усреднить несколько сабмитов одной модели в log1p (сеть по сидам)")
+    ap.add_argument("--derive-shift", default=None,
+                    help="перенести измеренный сдвиг с одной модели на другую без зонда: "
+                         "база.csv,новая.csv (нужен --b-base)")
+    ap.add_argument("--b-base", type=float, default=0.0578,
+                    help="сдвиг, измеренный зондом для базового файла")
     ap.add_argument("--weight", type=float, default=0.4,
                     help="вес сети при смешивании сабмитов")
     ap.add_argument("--out", default=None, help="имя файла результата")
@@ -166,6 +214,12 @@ def main() -> None:
     ap.add_argument("--note", default="")
     args = ap.parse_args()
 
+    if args.derive_shift:
+        parts = [s.strip() for s in args.derive_shift.split(",") if s.strip()]
+        if len(parts) != 2:
+            raise SystemExit("нужно два файла через запятую: база.csv,новая.csv")
+        derive_shift(parts[0], parts[1], args.b_base)
+        return
     if args.average_submissions:
         average_submissions([s.strip() for s in args.average_submissions.split(",") if s.strip()],
                             args.out)
