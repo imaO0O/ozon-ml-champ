@@ -34,12 +34,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import sys
 import time
+import warnings
 
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
+
+# Triton ищет установленный CUDA Toolkit (nvcc), которого при обычной установке
+# torch нет и не нужно: torch.compile мы не используем, а сама CUDA-рантайм
+# внутри колеса torch работает. Предупреждение безвредно и только мешает читать.
+warnings.filterwarnings("ignore", message=".*Failed to find CUDA.*")
 
 from config import (HORIZON, MODELS, SAMPLE_SUBMIT, SEED, SUBMISSIONS, TEST_CUTOFF,
                     train_cutoffs)
@@ -60,6 +67,61 @@ EXPERIMENT_FIELDS = [
 ]
 SUBMIT_FIELDS = ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
                  "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"]
+
+
+# bfloat16 включается флагом: у него 8 бит мантиссы, а рекуррентная сеть
+# прогоняет через них 180 шагов подряд, накапливая ошибку округления. Для
+# трансформера это безопасно, для GRU/LSTM — повод проверить, не в точности ли
+# дело, когда валидация скачет. Выключается ключом --no-amp.
+_AMP = True
+
+
+def autocast(device):
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                          enabled=_AMP and device.type == "cuda")
+
+
+class Progress:
+    """Однострочный индикатор хода работы.
+
+    В терминале строка обновляется на месте через `\\r`, а при перенаправлении
+    вывода в файл печатается редкими обычными строками: иначе лог фонового
+    прогона превращается в одну бесконечную строку без переводов.
+    """
+
+    def __init__(self, total: int, desc: str, width: int = 22):
+        self.total, self.desc, self.width = max(int(total), 1), desc, width
+        self.t0 = self.last = time.time()
+        self.tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self.printed = 0
+
+    @staticmethod
+    def _hms(sec: float) -> str:
+        sec = int(max(sec, 0))
+        return f"{sec // 60}м{sec % 60:02d}с" if sec >= 60 else f"{sec}с"
+
+    def update(self, done: int, extra: str = "") -> None:
+        now = time.time()
+        # В терминале — до пяти раз в секунду, в файл — раз в 20 секунд.
+        if done < self.total and now - self.last < (0.2 if self.tty else 20.0):
+            return
+        self.last = now
+        frac = min(done / self.total, 1.0)
+        el = now - self.t0
+        eta = el / frac - el if frac > 1e-9 else 0.0
+        full = int(frac * self.width)
+        msg = (f"  {self.desc} [{'█' * full}{'·' * (self.width - full)}] "
+               f"{done}/{self.total} {self._hms(el)}<{self._hms(eta)}{extra}")
+        if self.tty:
+            print("\r" + msg + " " * max(0, self.printed - len(msg)), end="", flush=True)
+            self.printed = len(msg)
+        else:
+            print(msg, flush=True)
+
+    def close(self) -> None:
+        if self.tty and self.printed:
+            print("\r" + " " * self.printed + "\r", end="", flush=True)
+        self.printed = 0
 
 
 # --------------------------------------------------------------------------- данные
@@ -174,17 +236,20 @@ class SeqNet(nn.Module):
 
 # --------------------------------------------------------------------------- обучение
 
-def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None):
+def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
+             desc: str = "предсказание"):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
+    prog = Progress(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
-        for x, _, take in batches(seq, rows, cutoff, lookback, batch_size):
+        for i, (x, _, take) in enumerate(batches(seq, rows, cutoff, lookback, batch_size), 1):
             xb = to_device(x, mean, std, device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                enabled=device.type == "cuda"):
+            with autocast(device):
                 p = model(xb)
             out[take] = p.float().cpu().numpy()
+            prog.update(i)
+    prog.close()
     return out
 
 
@@ -222,7 +287,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     history = []
     for epoch in range(1, n_epochs + 1):
         model.train()
-        t0, run, seen = time.time(), 0.0, 0
+        t0, run, seen, done = time.time(), 0.0, 0, 0
+        prog = Progress(steps, f"эпоха {epoch}/{n_epochs}")
         # Срезы перемешиваются целиком, а не построчно: батч из одного среза —
         # это и локальность memmap, и корректные окна (у срезов разные границы).
         for ci in rng.permutation(len(train_cuts)):
@@ -232,8 +298,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                                     ylog, shuffle=True, rng=rng):
                 xb = to_device(x, mean, std, device)
                 tb = torch.from_numpy(yb).float().to(device)
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                    enabled=device.type == "cuda"):
+                with autocast(device):
                     loss = nn.functional.mse_loss(model(xb), tb)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -243,11 +308,14 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                     sched.step()
                 run += float(loss) * len(yb)
                 seen += len(yb)
+                done += 1
+                prog.update(done, f" | RMSE {np.sqrt(run / seen):.4f}")
+        prog.close()
 
         line = f"эпоха {epoch:>2}/{n_epochs} | train RMSE {np.sqrt(run / seen):.5f}"
         if len(val_rows):
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                         mean, std, device)
+                         mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация")
             score = rmse_log(np.log1p(val_y), p)
             history.append(score)
             mark = ""
@@ -279,8 +347,7 @@ def predict_empty(model, args, mean, std, device) -> float:
     model.eval()
     with torch.no_grad():
         xb = to_device(x, mean, std, device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                            enabled=device.type == "cuda"):
+        with autocast(device):
             return float(model(xb).float().cpu().numpy()[0])
 
 
@@ -345,8 +412,16 @@ def main() -> None:
     ap.add_argument("--val-cutoff", default=None, help="валидационный срез, ГГГГ-ММ-ДД")
     ap.add_argument("--train-cutoffs", default=None, help="явный список обучающих срезов")
     ap.add_argument("--subsample", type=int, default=0,
-                    help="взять не больше N пользователей на срез (быстрая проверка)")
+                    help="не больше N пользователей на ОБУЧАЮЩИЙ срез (быстрая проверка); "
+                         "валидация всегда полная, иначе число несопоставимо с журналом")
+    ap.add_argument("--val-subsample", type=int, default=0,
+                    help="урезать и валидацию — только для отладки скорости: "
+                         "две случайные половины валидации расходятся на 0.007 RMSLE, "
+                         "поэтому такое число нельзя сравнивать ни с чем")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="считать в float32 вместо bfloat16: у bf16 8 бит мантиссы, "
+                         "а рекуррентная сеть накапливает через них 180 шагов")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--name", default="seq")
     ap.add_argument("--note", default="")
@@ -357,6 +432,8 @@ def main() -> None:
                     help="сохранить предсказания на валидации для бленда с бустингом")
     args = ap.parse_args()
 
+    global _AMP
+    _AMP = not args.no_amp
     device = torch.device(args.device)
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)} | "
@@ -376,23 +453,33 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     train_rows, train_y = [], []
+    print(f"считаю таргеты: {len(train_cuts) + 1} проходов по логу "
+          f"(на каждый срез — свой полный проход)")
     for c in train_cuts:
+        t0 = time.time()
         r, y = targets_for(c, users, first_day)
         if args.subsample and len(r) > args.subsample:
             keep = np.sort(rng.choice(len(r), args.subsample, replace=False))
             r, y = r[keep], y[keep]
         train_rows.append(r)
         train_y.append(y)
-        print(f"  срез {c}: {len(r):,} пользователей | покупателей {(y > 0).mean():.2%}")
+        print(f"  срез {c}: {len(r):,} пользователей | покупателей {(y > 0).mean():.2%} "
+              f"| {time.time() - t0:.0f}s")
+    t0 = time.time()
     val_rows, val_y = targets_for(val_cut, users, first_day)
-    if args.subsample and len(val_rows) > args.subsample:
-        keep = np.sort(rng.choice(len(val_rows), args.subsample, replace=False))
+    print(f"  (валидационный таргет за {time.time() - t0:.0f}s)")
+    if args.val_subsample and len(val_rows) > args.val_subsample:
+        keep = np.sort(rng.choice(len(val_rows), args.val_subsample, replace=False))
         val_rows, val_y = val_rows[keep], val_y[keep]
+        print("ВНИМАНИЕ: валидация урезана — это число несравнимо с experiments.csv")
     print(f"  валидация {val_cut}: {len(val_rows):,} пользователей | "
           f"покупателей {(val_y > 0).mean():.2%}")
 
+    t0 = time.time()
+    print("считаю масштаб каналов по выборке обучающих окон...", flush=True)
     mean_np, std_np = channel_stats(seq, train_rows[0], train_cuts[0], args.lookback,
                                     seed=args.seed)
+    print(f"  готово за {time.time() - t0:.0f}s")
     mean = torch.from_numpy(mean_np).to(device)
     std = torch.from_numpy(std_np).to(device)
 
@@ -421,8 +508,13 @@ def main() -> None:
         "gini_blend": round(res["gini"], 4), "sum_bias_blend": round(res["sum_bias"], 4),
         "best_iter_single": best_epoch, "stride": 30, "halflife": "",
         "val_cutoff": str(val_cut), "train_cutoffs": " ".join(str(c) for c in train_cuts),
-        "note": args.note or (f"{args.arch} hidden={args.hidden} layers={args.layers} "
-                              f"lookback={args.lookback} bs={args.batch_size} lr={args.lr}"),
+        # Отметка о подвыборке обязательна: строка с урезанным обучением или
+        # урезанной валидацией стоит в журнале рядом с полными и без пометки
+        # была бы неотличима от них.
+        "note": ((f"ПОДВЫБОРКА train={args.subsample or 'полн'} "
+                  f"val={args.val_subsample or 'полн'}; " if args.subsample or args.val_subsample else "")
+                 + (args.note or f"{args.arch} hidden={args.hidden} layers={args.layers} "
+                                 f"lookback={args.lookback} bs={args.batch_size} lr={args.lr}")),
     })
 
     if not args.final:
