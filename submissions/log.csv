@@ -18,3 +18,4 @@ blend_cal_avg3.csv,2026-08-12T15:56:11,632542a+dirty,blend_seq,blend,0.4,,,,1061
 blend_final.csv,2026-08-12T15:56:23,632542a+dirty,probe,shift,,,,,9847954,0.0000,,зонд уровня: blend_cal_avg3.csv со сдвигом -0.073 в log1p
 blend_w025.csv,2026-08-12T16:05:58,47657ec+dirty,blend_seq,blend,0.25,,,,10394136,0.0000,,"бленд в log1p: lgbm_ens_full_calib.csv и gru_avg3.csv, вес сети 0.25; поправки калибровки не применялись"
 blend_w025_final.csv,2026-08-12T16:06:05,47657ec+dirty,probe,shift,,,,,9917630,0.0000,,зонд уровня: blend_w025.csv со сдвигом -0.046 в log1p
+probe_scale_w025.csv,2026-08-12T16:08:40,f664cc8+dirty,probe,scale,,,,,10464413,0.0005,,"зонд размаха: blend_w025_final.csv, alpha=1.020, Var=2.60552"

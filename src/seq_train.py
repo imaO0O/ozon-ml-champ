@@ -52,7 +52,8 @@ from config import (HORIZON, MODELS, SAMPLE_SUBMIT, SEED, SUBMISSIONS, TEST_CUTO
                     train_cutoffs)
 from features import build_target
 from metrics import report, rmse_log
-from seq_data import (CHANNELS, gather, history_mask, open_seq, window_bounds)
+from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, gather, history_mask,
+                      open_seq, window_bounds)
 from utils import append_csv, git_commit
 
 # Колонки и их порядок — ровно как в самом models/experiments.csv, а не как в
@@ -164,7 +165,7 @@ def targets_for(cutoff: dt.date, users: np.ndarray, first_day: np.ndarray):
 
 
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
-                  sample: int = 20000, seed: int = SEED):
+                  sample: int = 20000, seed: int = SEED, bin_days: int = 1):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
 
     Считать по всем данным нельзя: в выборку попал бы валидационный срез.
@@ -172,21 +173,52 @@ def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
     """
     rng = np.random.default_rng(seed)
     sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
-    x = gather(seq, sel, cutoff, lookback)[:, :, :len(CHANNELS)]
+    x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)[:, :, :len(CHANNELS)]
     mean = x.mean(axis=(0, 1))
     std = x.std(axis=(0, 1))
     std[std < 1e-6] = 1.0
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+# Индексы каналов в массиве gather: сначала CHANNELS, затем добавленный observed.
+SUM_IDX = [CHANNELS.index(c) for c in SUM_CHANNELS]
+MEAN_IDX = [CHANNELS.index(c) for c in MEAN_CHANNELS] + [len(CHANNELS)]
+
+
+def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
+    """Свернуть окно в шаги по `bin_days` дней.
+
+    Обучение упирается в одну и ту же величину train RMSE с первой эпохи при
+    любых точности, скорости обучения и сиде — так выглядит предел
+    представления, а не оптимизации: 180 шагов вектора, у которого ненулевые
+    значения встречаются в паре процентов дней. Неделя как шаг делает каждый
+    шаг плотным и укорачивает рекуррентность в семь раз.
+
+    Величины складываются в исходной шкале (log1p снимается и надевается
+    обратно), иначе сумма логарифмов подменила бы логарифм суммы.
+    """
+    if bin_days <= 1:
+        return x
+    n, t, c = x.shape
+    if t % bin_days:
+        raise SystemExit(f"окно {t} не делится на шаг {bin_days} — "
+                         f"главный цикл должен был подрезать его заранее")
+    g = x.reshape(n, t // bin_days, bin_days, c)
+    out = np.empty((n, t // bin_days, c), dtype=np.float32)
+    out[:, :, SUM_IDX] = np.log1p(np.expm1(g[:, :, :, SUM_IDX]).sum(axis=2))
+    out[:, :, MEAN_IDX] = g[:, :, :, MEAN_IDX].mean(axis=2)
+    return out
+
+
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
-            y: np.ndarray | None = None, shuffle: bool = False, rng=None):
+            y: np.ndarray | None = None, shuffle: bool = False, rng=None,
+            bin_days: int = 1):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
-        x = gather(seq, sel, cutoff, lookback)
+        x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)
         yield x, (None if y is None else y[take]), take
 
 
@@ -237,13 +269,14 @@ class SeqNet(nn.Module):
 # --------------------------------------------------------------------------- обучение
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
-             desc: str = "предсказание"):
+             desc: str = "предсказание", bin_days: int = 1):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
     prog = Progress(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
-        for i, (x, _, take) in enumerate(batches(seq, rows, cutoff, lookback, batch_size), 1):
+        for i, (x, _, take) in enumerate(
+                batches(seq, rows, cutoff, lookback, batch_size, bin_days=bin_days), 1):
             xb = to_device(x, mean, std, device)
             with autocast(device):
                 p = model(xb)
@@ -268,10 +301,12 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     итераций фиксируется заранее).
     """
     torch.manual_seed(args.seed)
+    steps = args.lookback // args.bin
     model = SeqNet(len(CHANNELS) + 1, args.hidden, args.layers, args.arch,
-                   args.dropout, args.lookback).to(device)
+                   args.dropout, steps).to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней | "
+    print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней "
+          f"= {steps} шагов по {args.bin} дн. | {len(CHANNELS) + 1} каналов | "
           f"устройство {device}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -295,7 +330,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             cut, rows, y = train_cuts[ci], train_rows[ci], train_y[ci]
             ylog = np.log1p(y)
             for x, yb, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                    ylog, shuffle=True, rng=rng):
+                                    ylog, shuffle=True, rng=rng, bin_days=args.bin):
                 xb = to_device(x, mean, std, device)
                 tb = torch.from_numpy(yb).float().to(device)
                 with autocast(device):
@@ -315,7 +350,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
         line = f"эпоха {epoch:>2}/{n_epochs} | train RMSE {np.sqrt(run / seen):.5f}"
         if len(val_rows):
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                         mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация")
+                         mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация",
+                         bin_days=args.bin)
             score = rmse_log(np.log1p(val_y), p)
             history.append(score)
             mark = ""
@@ -342,7 +378,7 @@ def predict_empty(model, args, mean, std, device) -> float:
     `observed = 1` намеренно: дни существовали, активности в них не было —
     это не то же самое, что «данных за эти дни нет».
     """
-    x = np.zeros((1, args.lookback, len(CHANNELS) + 1), dtype=np.float32)
+    x = np.zeros((1, args.lookback // args.bin, len(CHANNELS) + 1), dtype=np.float32)
     x[:, :, len(CHANNELS)] = 1.0
     model.eval()
     with torch.no_grad():
@@ -363,7 +399,7 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
 
     rows = pos.copy()
     p_log = evaluate(model, seq, rows, TEST_CUTOFF, args.lookback, args.batch_size,
-                     mean, std, device)
+                     mean, std, device, bin_days=args.bin)
     # У неизвестных пользователей searchsorted указал на чужую строку — им
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
@@ -399,6 +435,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="gru", choices=["gru", "lstm", "transformer"])
     ap.add_argument("--lookback", type=int, default=180, help="длина окна в днях")
+    ap.add_argument("--bin", type=int, default=1,
+                    help="сколько дней в одном шаге последовательности: 1 — по дням, "
+                         "7 — по неделям (180 дней превращаются в 26 плотных шагов). "
+                         "Длина окна должна делиться на это число")
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.1)
@@ -453,6 +493,14 @@ def main() -> None:
               f"точность {precision}")
 
     seq, users, first_day, _ = open_seq()
+    # Бины выравниваются по cutoff'у: последний шаг это дни, непосредственно
+    # предшествующие срезу. Поэтому лишние дни отрезаются с дальнего конца,
+    # где они стоят дешевле всего — рецентность решает в этой задаче больше всего.
+    if args.lookback % args.bin:
+        trimmed = args.lookback - args.lookback % args.bin
+        print(f"окно {args.lookback} не делится на шаг {args.bin} — "
+              f"беру {trimmed} дней ({trimmed // args.bin} шагов), лишние отрезаны с дальнего конца")
+        args.lookback = trimmed
     parse_date = dt.date.fromisoformat
     val_cut, train_cuts = cutoff_split(
         args.cutoffs,
@@ -491,7 +539,7 @@ def main() -> None:
     t0 = time.time()
     print("считаю масштаб каналов по выборке обучающих окон...", flush=True)
     mean_np, std_np = channel_stats(seq, train_rows[0], train_cuts[0], args.lookback,
-                                    seed=args.seed)
+                                    seed=args.seed, bin_days=args.bin)
     print(f"  готово за {time.time() - t0:.0f}s")
     mean = torch.from_numpy(mean_np).to(device)
     std = torch.from_numpy(std_np).to(device)
@@ -500,7 +548,7 @@ def main() -> None:
                                        val_rows, val_y, val_cut, args, mean, std, device)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                     mean, std, device)
+                     mean, std, device, bin_days=args.bin)
     print(f"\n--- валидация (cutoff {val_cut}) ---")
     res = report(val_y, np.expm1(np.clip(p_log, 0, None)), args.arch)
 
@@ -511,7 +559,7 @@ def main() -> None:
 
     append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
         "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
-        "feat_ver": f"seq{len(CHANNELS)}x{args.lookback}", "blocks": "seq",
+        "feat_ver": f"seq{len(CHANNELS)}x{args.lookback}b{args.bin}", "blocks": "seq",
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
         "n_features": len(CHANNELS) + 1,
         "rmsle_single": round(res["rmsle"], 5), "rmsle_two_stage": "",
@@ -531,7 +579,8 @@ def main() -> None:
         "note": ((f"ПОДВЫБОРКА train={args.subsample or 'полн'} "
                   f"val={args.val_subsample or 'полн'}; " if args.subsample or args.val_subsample else "")
                  + (args.note or f"{args.arch} hidden={args.hidden} layers={args.layers} "
-                                 f"lookback={args.lookback} bs={args.batch_size} lr={args.lr}")
+                                 f"lookback={args.lookback} bin={args.bin} "
+                                 f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
     })
 

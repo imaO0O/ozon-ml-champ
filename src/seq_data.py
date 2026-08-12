@@ -38,14 +38,38 @@ from features import scan_log
 
 # Порядок каналов фиксирован: он попадает в веса обученной сети, менять его
 # задним числом нельзя — иначе старые чекпойнты молча начнут читать не те данные.
-CHANNELS = [
+RAW_CHANNELS = [
     "gmv", "gmv_search", "gmv_cat",                     # деньги
     "to_ord", "to_cart", "searches",                    # счётчики общие
     "search_to_ord", "search_to_cart",                  # счётчики поиска
     "cat_to_ord", "cat_to_cart",                        # счётчики каталога
     "search", "cat",                                    # флаги «был в поиске / каталоге»
 ]
-LOG_CHANNELS = CHANNELS[:10]  # флаги в log1p не переводим — они и так 0/1
+LOG_CHANNELS = RAW_CHANNELS[:10]  # флаги в log1p не переводим — они и так 0/1
+
+# Доли пользователя в суточном объёме площадки. Зачем они здесь: сеть,
+# обученная на абсолютных рублях, промахивается по уровню тестового окна
+# на +0.20 в log1p, тогда как бустинг — только на -0.058. Разница ровно в том,
+# что у бустинга есть блок `platform` с долями, а у сети не было ничего.
+# Уровень площадки за год менялся вдвое, а доля от него не зависит.
+#
+# Утечки нет: суточный итог за день D считается по событиям дня D, а окно
+# всегда обрывается на дне перед cutoff'ом — значит в него попадают только дни,
+# целиком лежащие в прошлом.
+#
+# Доли масштабируются на число пользователей: сырая доля порядка 1e-5 попала бы
+# в субнормальный диапазон float16 и потеряла бы точность. После умножения
+# единица означает «вклад среднего пользователя за этот день».
+SHARE_CHANNELS = ["share_gmv", "share_ord", "share_searches"]
+SHARE_SOURCE = [("gmv", "day_gmv"), ("to_ord", "day_ord"), ("searches", "day_searches")]
+
+CHANNELS = RAW_CHANNELS + SHARE_CHANNELS
+
+# Как сворачивать канал при укрупнении шага (см. --bin в seq_train). Величины
+# складываются в исходной шкале — «сколько всего за неделю», — а флаги
+# усредняются: «в какой доле дней недели пользователь заходил».
+SUM_CHANNELS = LOG_CHANNELS + SHARE_CHANNELS
+MEAN_CHANNELS = [c for c in CHANNELS if c not in SUM_CHANNELS]
 
 N_DAYS = (DATA_END - DATA_START).days + 1
 N_CHANNELS = len(CHANNELS)
@@ -115,6 +139,17 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
     first_day = bounds["first"].to_numpy().astype(np.int32)
     last_day = bounds["last"].to_numpy().astype(np.int32)
 
+    # Суточные итоги площадки — 409 строк, считаются одним проходом по всем
+    # пользователям и затем подмешиваются в каждый кусок.
+    day_tot = (
+        lf.group_by("event_date")
+        .agg(pl.col("gmv").sum().alias("day_gmv"),
+             pl.col("to_ord").sum().alias("day_ord"),
+             pl.col("searches").sum().alias("day_searches"))
+        .collect(engine="streaming")
+    )
+    print(f"суточные итоги площадки: {day_tot.height} дней")
+
     arr = np.lib.format.open_memmap(
         path, mode="w+", dtype=np.float16, shape=(n_users, N_DAYS, N_CHANNELS)
     )
@@ -128,10 +163,15 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
         u_lo, u_hi = int(users[lo]), int(users[hi - 1])
         df = (
             lf.filter((pl.col("user_id") >= u_lo) & (pl.col("user_id") <= u_hi))
+            .join(day_tot.lazy(), on="event_date", how="left")
             .with_columns(
                 (pl.col("event_date") - pl.lit(DATA_START)).dt.total_days().cast(pl.Int32).alias("_d"),
-                *[pl.col(c).cast(pl.Float32).log1p() for c in LOG_CHANNELS],
+                # Доли считаются ДО log1p исходных колонок, иначе в числителе
+                # окажется логарифм вместо самой величины.
+                *[(pl.col(num) / (pl.col(den) + 1e-9) * n_users).cast(pl.Float32).log1p().alias(name)
+                  for name, (num, den) in zip(SHARE_CHANNELS, SHARE_SOURCE)],
             )
+            .with_columns(*[pl.col(c).cast(pl.Float32).log1p() for c in LOG_CHANNELS])
             .select(["user_id", "_d", *CHANNELS])
             .collect(engine="streaming")
         )
