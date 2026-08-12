@@ -55,6 +55,46 @@ def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return users, np.mean(preds, axis=0), target
 
 
+def average_submissions(sources: list[str], out: str | None) -> None:
+    """Усреднить несколько сабмитов одной модели в log1p-шкале (сеть по сидам).
+
+    Зачем отдельно от blend_submissions. На валидации сеть проверялась средним
+    трёх сидов (1.68446), а один сид даёт 1.68266…1.68804 — разброс 0.0054,
+    больше, чем весь выигрыш бленда. Сабмит из одного сида поэтому слабее того,
+    что измерено, и с вероятностью около трети попадёт на худший сид.
+    """
+    import polars as pl
+
+    from config import SUBMISSIONS
+
+    if len(sources) < 2:
+        raise SystemExit("нужно хотя бы два файла через запятую")
+    subs = [pl.read_csv(SUBMISSIONS / s) for s in sources]
+    for s in subs[1:]:
+        if not (s["user_id"] == subs[0]["user_id"]).all():
+            raise SystemExit("порядок user_id в файлах различается")
+    logs = [np.log1p(s["predict"].to_numpy().astype(np.float64)) for s in subs]
+    mixed = np.clip(np.expm1(np.mean(logs, axis=0)), 0, None)
+
+    name = out or f"avg{len(sources)}_{dt.datetime.now():%m%d_%H%M}.csv"
+    path = SUBMISSIONS / name
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out")
+    pl.DataFrame({"user_id": subs[0]["user_id"],
+                  "predict": mixed.astype(np.float32)}).write_csv(path)
+    print(f"{path}")
+    print(f"  усреднено файлов: {len(sources)} ({', '.join(sources)})")
+    print(f"  суммы: {', '.join(f'{np.expm1(l).sum():,.0f}' for l in logs)} -> {mixed.sum():,.0f}")
+    append_csv(SUBMISSIONS / "log.csv",
+               ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
+                "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"],
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "avg_seeds", "model": "avg",
+                "pred_sum": round(float(mixed.sum())),
+                "pred_zeros": f"{(mixed < 1e-6).mean():.4f}",
+                "note": f"среднее {len(sources)} сидов сети в log1p: {', '.join(sources)}"})
+
+
 def blend_submissions(sources: list[str], weight: float, out: str | None) -> None:
     """Смешать два готовых сабмита в log1p-шкале: p = (1-w)*первый + w*второй.
 
@@ -109,6 +149,8 @@ def main() -> None:
     ap.add_argument("--blend-submissions", default=None,
                     help="смешать два готовых сабмита через запятую: бустинг,сеть "
                          "(вместо проверки на валидации)")
+    ap.add_argument("--average-submissions", default=None,
+                    help="усреднить несколько сабмитов одной модели в log1p (сеть по сидам)")
     ap.add_argument("--weight", type=float, default=0.4,
                     help="вес сети при смешивании сабмитов")
     ap.add_argument("--out", default=None, help="имя файла результата")
@@ -124,12 +166,17 @@ def main() -> None:
     ap.add_argument("--note", default="")
     args = ap.parse_args()
 
+    if args.average_submissions:
+        average_submissions([s.strip() for s in args.average_submissions.split(",") if s.strip()],
+                            args.out)
+        return
     if args.blend_submissions:
         blend_submissions([s.strip() for s in args.blend_submissions.split(",") if s.strip()],
                           args.weight, args.out)
         return
     if not args.seq:
-        raise SystemExit("нужен --seq (проверка на валидации) или --blend-submissions")
+        raise SystemExit("нужен --seq (проверка на валидации), --blend-submissions "
+                         "или --average-submissions")
     val_cut = dt.date.fromisoformat(args.val_cutoff)
 
     print("=== предсказания сети ===")
