@@ -55,6 +55,33 @@ def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return users, np.mean(preds, axis=0), target
 
 
+def expand(patterns: list[str]) -> list[str]:
+    """Раскрыть маски вида `gru_final_s7_*.csv` в имена файлов из submissions/.
+
+    Имена сабмитов содержат время создания, поэтому набирать их руками — верный
+    способ ошибиться. Маска раскрывается по алфавиту, дубликаты убираются.
+    """
+    from config import SUBMISSIONS
+
+    out: list[str] = []
+    for p in patterns:
+        if any(ch in p for ch in "*?["):
+            found = sorted(f.name for f in SUBMISSIONS.glob(p))
+            if not found:
+                raise SystemExit(f"под маску {p!r} в submissions/ ничего не подошло")
+            if len(found) > 1:
+                print(f"  маска {p} -> {len(found)} файлов: {', '.join(found)}")
+            out.extend(found)
+        else:
+            out.append(p)
+    seen, uniq = set(), []
+    for f in out:
+        if f not in seen:
+            seen.add(f)
+            uniq.append(f)
+    return uniq
+
+
 def derive_shift(base: str, new: str, b_base: float) -> None:
     """Перенести измеренный зондом сдвиг с одной модели на другую — без зонда.
 
@@ -110,6 +137,7 @@ def average_submissions(sources: list[str], out: str | None) -> None:
 
     from config import SUBMISSIONS
 
+    sources = expand(sources)
     if len(sources) < 2:
         raise SystemExit("нужно хотя бы два файла через запятую")
     subs = [pl.read_csv(SUBMISSIONS / s) for s in sources]
@@ -152,6 +180,7 @@ def blend_submissions(sources: list[str], weight: float, out: str | None) -> Non
 
     from config import SAMPLE_SUBMIT, SUBMISSIONS
 
+    sources = expand(sources)
     if len(sources) != 2:
         raise SystemExit("нужно ровно два файла через запятую: бустинг,сеть")
     subs = [pl.read_csv(SUBMISSIONS / s) for s in sources]
