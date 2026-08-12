@@ -55,9 +55,64 @@ def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return users, np.mean(preds, axis=0), target
 
 
+def blend_submissions(sources: list[str], weight: float, out: str | None) -> None:
+    """Смешать два готовых сабмита в log1p-шкале: p = (1-w)*первый + w*второй.
+
+    Веса подбираются на валидации (`--full`), а применяются здесь. Смешивание
+    идёт в log1p — там же, где живёт метрика и где складываются предсказания
+    участников ансамбля в `models.Ensemble`.
+
+    Поправки калибровки к результату не относятся: они измерены зондами для
+    другой модели. Для бленда нужны свои зонды (PLAN.md, раздел 3).
+    """
+    import polars as pl
+
+    from config import SAMPLE_SUBMIT, SUBMISSIONS
+
+    if len(sources) != 2:
+        raise SystemExit("нужно ровно два файла через запятую: бустинг,сеть")
+    subs = [pl.read_csv(SUBMISSIONS / s) for s in sources]
+    if not (subs[0]["user_id"] == subs[1]["user_id"]).all():
+        raise SystemExit("порядок user_id в файлах различается")
+    ref = pl.read_csv(SAMPLE_SUBMIT)
+    if not (ref["user_id"] == subs[0]["user_id"]).all():
+        raise SystemExit("порядок user_id разошёлся с sample_submit")
+
+    logs = [np.log1p(s["predict"].to_numpy().astype(np.float64)) for s in subs]
+    mixed = np.clip(np.expm1((1 - weight) * logs[0] + weight * logs[1]), 0, None)
+
+    name = out or f"blend_w{weight:.2f}_{dt.datetime.now():%m%d_%H%M}.csv"
+    path = SUBMISSIONS / name
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out")
+    pl.DataFrame({"user_id": subs[0]["user_id"],
+                  "predict": mixed.astype(np.float32)}).write_csv(path)
+    print(f"{path}")
+    print(f"  {sources[0]} (вес {1 - weight:.2f}) + {sources[1]} (вес {weight:.2f})")
+    print(f"  суммы: {np.expm1(logs[0]).sum():,.0f} и {np.expm1(logs[1]).sum():,.0f} "
+          f"-> {mixed.sum():,.0f}")
+    print("\nПоправки калибровки старой модели к этому файлу НЕ относятся —\n"
+          "нужны свои зонды уровня и размаха (PLAN.md, раздел 3; TASKS.md, A2).")
+    append_csv(SUBMISSIONS / "log.csv",
+               ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
+                "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"],
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "blend_seq", "model": "blend",
+                "blend_w": round(weight, 2), "pred_sum": round(float(mixed.sum())),
+                "pred_zeros": f"{(mixed < 1e-6).mean():.4f}",
+                "note": f"бленд в log1p: {sources[0]} и {sources[1]}, вес сети {weight:.2f}; "
+                        f"поправки калибровки не применялись"})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seq", required=True,
+    ap.add_argument("--blend-submissions", default=None,
+                    help="смешать два готовых сабмита через запятую: бустинг,сеть "
+                         "(вместо проверки на валидации)")
+    ap.add_argument("--weight", type=float, default=0.4,
+                    help="вес сети при смешивании сабмитов")
+    ap.add_argument("--out", default=None, help="имя файла результата")
+    ap.add_argument("--seq", default=None,
                     help="через запятую: .npz с предсказаниями сети (--save-val-pred)")
     ap.add_argument("--val-cutoff", default="2026-01-15")
     ap.add_argument("--cutoffs", type=int, default=6)
@@ -68,6 +123,13 @@ def main() -> None:
                          "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+
+    if args.blend_submissions:
+        blend_submissions([s.strip() for s in args.blend_submissions.split(",") if s.strip()],
+                          args.weight, args.out)
+        return
+    if not args.seq:
+        raise SystemExit("нужен --seq (проверка на валидации) или --blend-submissions")
     val_cut = dt.date.fromisoformat(args.val_cutoff)
 
     print("=== предсказания сети ===")
@@ -130,14 +192,22 @@ def main() -> None:
             best_w, best_r = float(w), r
 
     print(f"\n=== итог на {val_cut}, {len(yva):,} пользователей ===")
-    print(f"  бустинг ({'рабочая модель' if args.full else 'одиночный LightGBM'})"
-          f"{'' if args.full else '  '}  RMSLE {r_gbm:.5f}")
-    print(f"  сеть               RMSLE {r_seq:.5f}")
+    report(yva, np.expm1(np.clip(p_gbm, 0, None)),
+           "бустинг" if args.full else "одиночный lgbm")
+    report(yva, np.expm1(np.clip(p_seq, 0, None)), "сеть")
     print(f"  корреляция предсказаний в log1p-шкале: {corr:.4f}")
     print(f"  лучший бленд       RMSLE {best_r:.5f} при весе сети {best_w:.2f}")
     gain = min(r_gbm, r_seq) - best_r
     print(f"  выигрыш к лучшему участнику: {gain:+.5f}")
     report(yva, np.expm1(np.clip(best_w * p_seq + (1 - best_w) * p_gbm, 0, None)), "бленд")
+
+    # Оптимальный вес подобран на той же валидации, по которой отчитываемся, и
+    # между срезами он разный (0.50 на январе, 0.30 на декабре). Поэтому важнее
+    # оптимума то, насколько он плоский: если фиксированный вес, выбранный
+    # заранее, даёт почти столько же, результат переносится, а не подгоняется.
+    print("\n  вес сети:  " + "  ".join(f"{w:>7.2f}" for w in (0.2, 0.3, 0.4, 0.5, 0.6)))
+    print("  RMSLE:     " + "  ".join(
+        f"{rmse_log(ylog, w * p_seq + (1 - w) * p_gbm):.5f}" for w in (0.2, 0.3, 0.4, 0.5, 0.6)))
 
     if gain < 0.002:
         print("\nвывод: выигрыш ниже порога различимости 0.002 — на одном срезе\n"
