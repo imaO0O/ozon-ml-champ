@@ -1,0 +1,139 @@
+"""Добавляет ли сеть что-то ансамблю — проверка без единого сабмита.
+
+Зачем. Сеть проигрывает бустингу как самостоятельная модель, но это ещё не
+приговор: ансамбль зарабатывает на **непохожести ошибок**, а не на силе
+участника. Именно поэтому CatBoost почти ничего не добавил (PLAN.md, раздел 4)
+— он был равен LightGBM и ошибался в тех же местах. Сеть устроена принципиально
+иначе, и её ошибки могут лежать в других местах даже при худшем среднем.
+
+Что считается:
+
+* RMSLE бустинга и сети по отдельности на одной и той же валидации;
+* корреляция их предсказаний в log1p-шкале — чем ниже, тем больше надежды;
+* оптимальный вес бленда и выигрыш относительно **лучшего** участника, а не
+  среднего: смесь, которая хуже своего лучшего участника, бесполезна.
+
+Бустинг обучается здесь же, на вашей машине: числа из журнала измерены на
+чужом железе, а сравнивать предсказания можно только полученные в одном прогоне.
+Нужен кэш признаков — `python -u src/datasets.py --test`.
+
+Несколько `.npz` усредняются в log1p-шкале до бленда: это ансамбль сетей по
+сидам, и он сам по себе обычно сильнее одиночной сети.
+
+    python -u src/seq_blend.py --seq models/gru_fp32_valpred_2026-01-15.npz
+    python -u src/seq_blend.py --seq models/gru_fp32_valpred_2026-01-15.npz,models/gru_v1_valpred_2026-01-15.npz
+    python -u src/seq_blend.py --seq models/gru_fp32_dec_valpred_2025-12-16.npz --val-cutoff 2025-12-16 --cutoffs 7
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+
+import numpy as np
+
+from config import MODELS, ROOT
+from metrics import report, rmse_log
+from models import GBM
+from seq_train import EXPERIMENT_FIELDS
+from train import load_split, to_xy
+from utils import append_csv, git_commit
+
+
+def load_seq(paths: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Предсказания сети из одного или нескольких .npz, усреднённые в log1p."""
+    users = target = None
+    preds = []
+    for p in paths:
+        path = ROOT / p if not str(p).startswith(("/", "E:", "C:")) else p
+        d = np.load(path)
+        if users is None:
+            users, target = d["user_id"], d["target"]
+        elif not np.array_equal(users, d["user_id"]):
+            raise SystemExit(f"{p}: другой набор пользователей — файлы с разных срезов?")
+        preds.append(d["pred_log"])
+        print(f"  {path.name}: RMSLE {rmse_log(np.log1p(d['target']), d['pred_log']):.5f}")
+    return users, np.mean(preds, axis=0), target
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seq", required=True,
+                    help="через запятую: .npz с предсказаниями сети (--save-val-pred)")
+    ap.add_argument("--val-cutoff", default="2026-01-15")
+    ap.add_argument("--cutoffs", type=int, default=6)
+    ap.add_argument("--rounds", type=int, default=20000)
+    ap.add_argument("--note", default="")
+    args = ap.parse_args()
+    val_cut = dt.date.fromisoformat(args.val_cutoff)
+
+    print("=== предсказания сети ===")
+    seq_users, p_seq, seq_target = load_seq([s.strip() for s in args.seq.split(",") if s.strip()])
+    if len(p_seq.shape) != 1:
+        raise SystemExit("неожиданная форма предсказаний сети")
+
+    print(f"\n=== бустинг на вашей машине (валидация {val_cut}) ===")
+    train, val, feats, cuts = load_split(args.cutoffs, val_cutoff=val_cut)
+    Xtr, ytr = to_xy(train, feats)
+    Xva, yva = to_xy(val, feats)
+    del train
+    m = GBM("lgbm", "reg", "cpu", n_estimators=args.rounds, early_stopping=200)
+    m.fit(Xtr, np.log1p(ytr), Xva, np.log1p(yva), feature_names=feats)
+    p_gbm = m.predict(Xva)
+
+    # Выравнивание по user_id: порядок строк выборки признаков не совпадает
+    # с порядком в .npz, а складывать предсказания разных пользователей —
+    # ошибка, которая тихо испортит все числа ниже.
+    val_users = val["user_id"].to_numpy()
+    pos = np.searchsorted(seq_users, val_users)
+    if pos.max() >= len(seq_users) or not np.array_equal(seq_users[pos], val_users):
+        raise SystemExit("наборы пользователей сети и бустинга не совпадают: "
+                         "проверьте, что .npz с того же среза")
+    p_seq = p_seq[pos]
+    if not np.allclose(seq_target[pos], yva):
+        raise SystemExit("таргеты сети и бустинга разошлись — файлы с разных срезов")
+
+    ylog = np.log1p(yva)
+    r_gbm, r_seq = rmse_log(ylog, p_gbm), rmse_log(ylog, p_seq)
+    corr = float(np.corrcoef(p_gbm, p_seq)[0, 1])
+
+    best_w, best_r = 0.0, float("inf")
+    for w in np.linspace(0, 1, 101):
+        r = rmse_log(ylog, w * p_seq + (1 - w) * p_gbm)
+        if r < best_r:
+            best_w, best_r = float(w), r
+
+    print(f"\n=== итог на {val_cut}, {len(yva):,} пользователей ===")
+    print(f"  бустинг            RMSLE {r_gbm:.5f}")
+    print(f"  сеть               RMSLE {r_seq:.5f}")
+    print(f"  корреляция предсказаний в log1p-шкале: {corr:.4f}")
+    print(f"  лучший бленд       RMSLE {best_r:.5f} при весе сети {best_w:.2f}")
+    gain = min(r_gbm, r_seq) - best_r
+    print(f"  выигрыш к лучшему участнику: {gain:+.5f}")
+    report(yva, np.expm1(np.clip(best_w * p_seq + (1 - best_w) * p_gbm, 0, None)), "бленд")
+
+    if gain < 0.002:
+        print("\nвывод: выигрыш ниже порога различимости 0.002 — на одном срезе\n"
+              "это ничего не значит. Проверяйте на втором срезе и принимайте\n"
+              "только при положительном знаке на обоих (PLAN.md, раздел 2).")
+    if corr > 0.99:
+        print(f"\nосторожно: корреляция {corr:.4f} — сеть предсказывает почти то же самое,\n"
+              "что и бустинг. Пара с корреляцией 0.9997 уже проверялась как вторая\n"
+              "финальная кандидатура и не дала ничего (PLAN.md, раздел 8).")
+
+    append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
+        "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
+        "feat_ver": "seq+lgbm", "blocks": "all+seq", "name": "blend_seq_lgbm",
+        "model": "blend", "cutoffs": len(cuts) - 1, "n_features": len(feats),
+        "rmsle_single": round(r_gbm, 5), "rmsle_two_stage": round(r_seq, 5),
+        "rmsle_blend": round(best_r, 5), "blend_w": round(best_w, 2),
+        "gini_blend": "", "sum_bias_blend": "", "best_iter_single": m.best_iter,
+        "stride": 30, "halflife": "", "val_cutoff": str(val_cut),
+        "train_cutoffs": " ".join(str(c) for c in cuts[1:]),
+        "note": (args.note or f"бленд сети и LightGBM: corr={corr:.4f}, "
+                              f"выигрыш к лучшему {gain:+.5f}")
+                + f" [колонки: single=бустинг, two_stage=сеть]",
+    })
+
+
+if __name__ == "__main__":
+    main()

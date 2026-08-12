@@ -419,14 +419,18 @@ def main() -> None:
                          "две случайные половины валидации расходятся на 0.007 RMSLE, "
                          "поэтому такое число нельзя сравнивать ни с чем")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    # Умолчание зависит от архитектуры: измерено, что bf16 стоит рекуррентной
-    # сети 0.007 RMSLE (1.68979 против 1.68266 на январе), а трансформеру
-    # накапливать нечего — у него нет последовательной зависимости по шагам.
+    # Разница между bf16 и fp32 измерена и оказалась НЕразличимой: три сида в
+    # fp32 дали 1.68266 / 1.68798 / 1.68804 (среднее 1.6862, разброс 0.0054),
+    # единственный прогон в bf16 — 1.68979, то есть внутри того же разброса.
+    # Ранний вывод «fp32 выигрывает 0.007» был сравнением двух одиночных
+    # прогонов и не пережил проверки сидами. По правилу PLAN.md (раздел 2)
+    # подпороговый эффект принимается, только если ничего не стоит; fp32 стоит
+    # 45% времени эпохи (57с против 39с), поэтому умолчание — bf16.
     ap.add_argument("--amp", dest="amp", action="store_true", default=None,
-                    help="считать в bfloat16 (умолчание для transformer)")
+                    help="считать в bfloat16 (умолчание)")
     ap.add_argument("--no-amp", dest="amp", action="store_false",
-                    help="считать в float32 (умолчание для gru/lstm): у bf16 8 бит "
-                         "мантиссы, а рекуррентная сеть протаскивает через них 180 шагов")
+                    help="считать в float32: медленнее на 45%%, разницы в качестве "
+                         "на GRU не обнаружено (см. комментарий в коде)")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--name", default="seq")
     ap.add_argument("--note", default="")
@@ -439,7 +443,7 @@ def main() -> None:
 
     global _AMP
     if args.amp is None:
-        args.amp = args.arch == "transformer"
+        args.amp = True
     _AMP = args.amp
     device = torch.device(args.device)
     precision = "bf16" if _AMP and device.type == "cuda" else "fp32"
