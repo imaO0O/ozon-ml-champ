@@ -13,5 +13,6 @@ mixed_ens_0812_1243.csv,2026-08-12T12:43:37,06640ef+dirty,mixed_ens,lgbm,0.3,1.6
 mixed_ens_calib.csv,2026-08-12T12:45:22,06640ef+dirty,probe,quad,,,,,10131971,0.0016,,"вторая кандидатура: 5 LightGBM + 2 CatBoost, поправки перенесены с первой модели без собственных зондов"
 probe_blend_a102.csv,2026-08-12T20:37:30,d3d2913,probe,scale,,,,,10508206,0.0006,1.6518412585,"зонд растяжения для бленда трека C; ответ: alpha*=1.0051, 1.1 сигмы — не нужно"
 lgbm_ranks_0812_2154.csv,2026-08-12T21:54:45,62d83c7+dirty,lgbm_ranks,lgbm,0.2,1.68069,0.7376,0.5185,8743992,0.0000,,"ансамбль + блок ranks (242 признака), сырой"
-lgbm_ranks_shifted.csv,2026-08-12T21:55:20,62d83c7+dirty,probe,shift,,,,,9224622,0.0000,,зонд уровня: lgbm_ranks_0812_2154.csv со сдвигом +0.052 в log1p
-probe_ranks_a102.csv,2026-08-12T21:55:21,62d83c7+dirty,probe,scale,,,,,9720067,0.0000,,"зонд размаха: lgbm_ranks_shifted.csv, alpha=1.020, Var=2.35178"
+lgbm_ranks_shifted.csv,2026-08-12T21:55:20,62d83c7+dirty,probe,shift,,,,,9224622,0.0000,1.6551048346,зонд уровня: lgbm_ranks_0812_2154.csv со сдвигом +0.052 в log1p
+probe_ranks_a102.csv,2026-08-12T21:55:21,62d83c7+dirty,probe,scale,,,,,9720067,0.0000,1.6537225749,"зонд растяжения модели с рангами; ответ: alpha*=1.0586, 12 сигм"
+lgbm_ranks_calib.csv,2026-08-13T16:33:27,15164b7,probe,scale,,,,,10775051,0.0000,,"зонд размаха: lgbm_ranks_shifted.csv, alpha=1.059, Var=2.35178"
