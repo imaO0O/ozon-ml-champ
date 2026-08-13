@@ -90,9 +90,23 @@ def build_target(cutoff: dt.date, lf: pl.LazyFrame | None = None) -> pl.DataFram
 
 
 def build_dataset(cutoff: dt.date, with_target: bool = True,
-                  blocks: list[str] | None = None) -> pl.DataFrame:
+                  blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
+    """history — обрезать историю до одинаковой глубины на всех срезах.
+
+    Данные начинаются 2025-01-01, поэтому у старого обучающего среза истории
+    229 дней, у валидационного 379, у тестового 409. Из-за этого `tenure`
+    равен глубине истории и работает меткой среза, а «годовые» окна и
+    пожизненные величины считаются по разной глубине: to_ord_sum_365 на старом
+    срезе — сумма за 229 дней, на тесте за 365. На тесте tenure выходит за
+    пределы всего, что модель видела, а деревья не экстраполируют.
+
+    Таргет берётся из полного лога: обрезка касается только признаков.
+    """
     lf = scan_log()
-    df = build_features(cutoff, lf, blocks=blocks)
+    feat_lf = lf
+    if history:
+        feat_lf = lf.filter(pl.col("event_date") >= cutoff - dt.timedelta(days=history))
+    df = build_features(cutoff, feat_lf, blocks=blocks)
     if with_target:
         tgt = build_target(cutoff, lf)
         df = df.join(tgt, on="user_id", how="left").with_columns(
@@ -108,3 +122,4 @@ from . import lifetime  # noqa: E402,F401
 from . import ratios  # noqa: E402,F401
 from . import platform  # noqa: E402,F401
 from . import unit  # noqa: E402,F401
+from . import ranks  # noqa: E402,F401  (последним: ранжирует уже готовые признаки)

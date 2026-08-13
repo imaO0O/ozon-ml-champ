@@ -28,7 +28,7 @@ from utils import append_csv, git_commit
 
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
-               stride: int | None = None):
+               stride: int | None = None, history: int | None = None):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -51,8 +51,8 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     if not train_cuts:
         raise SystemExit(f"нет обучающих срезов раньше {latest_ok}: увеличьте --cutoffs")
     cuts = [val_cut, *train_cuts]
-    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks)
-    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks) for c in train_cuts]
+    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history)
+    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history) for c in train_cuts]
     feats = feature_names(val)
     # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
     # feats берётся из колонок val, поэтому в X эта колонка не попадёт.

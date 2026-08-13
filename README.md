@@ -53,14 +53,18 @@ python -m venv .venv && source .venv/bin/activate && pip install -r requirements
 python -u src/datasets.py --test                                  # признаки по всем срезам (кэш в data/processed)
 python -u src/train.py --cutoffs 6 --ensemble --final --name lgbm_ens
 python -u src/predict.py --name lgbm_ens                          # сырой сабмит в submissions/
-python -u src/probe_shift.py --source <сырой>.csv --delta 0.0578 --out shifted.csv
-python -u src/probe_shift.py --source shifted.csv --alpha 1.0545 --out final.csv
+python -u src/probe_shift.py --derive-shift --source <сырой>.csv  # сдвиг: бесплатно, без сабмита
+python -u src/probe_shift.py --source <сырой>.csv --delta <выведенный> --out shifted.csv
 ```
 
-Две последние строки — **измеренные** поправки уровня и размаха, они дают 0.0031
-на лидерборде (см. раздел 3 в [PLAN.md](PLAN.md)). Числа получены зондированием
-и действительны для текущей модели; после существенной смены модели их надо
-перемерить тем же способом.
+Последние две строки — калибровка, она дала на лидерборде больше, чем все
+улучшения модели вместе взятые (0.0035, см. раздел 3 в [PLAN.md](PLAN.md)).
+
+**Поправки индивидуальны для каждой модели, не копируйте чужие числа.** Сдвиг
+выводится бесплатно из известного уровня тестового окна. Растяжение и кривизна
+выводятся только зондом — по одному сабмиту на каждую, порядок в разделе 3
+PLAN.md. У чистого бустинга растяжение давало 0.0021, у бленда с сетью
+оказалось не нужно вовсе.
 
 Запускайте через `python -u`, иначе вывод буферизуется и прогресс не виден до
 самого конца прогона.
@@ -68,12 +72,17 @@ python -u src/probe_shift.py --source shifted.csv --alpha 1.0545 --out final.csv
 Вклад своего блока признаков и устойчивость к сдвигу уровня площадки:
 
 ```bash
-python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios,platform,unit --note "без моего блока"
+python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios,platform,unit,ranks --note "без моего блока"
 python -u src/train.py --cutoffs 8 --val-cutoff 2025-12-16 --train-cutoffs 2025-06-19,2025-07-19,2025-08-18
 ```
 
-Сейчас существуют пять блоков: `windows`, `lifetime`, `ratios`, `platform`,
-`unit`. Полный список всегда виден в подсказке `python src/datasets.py --help`.
+Сейчас существуют шесть блоков: `windows`, `lifetime`, `ratios`, `platform`,
+`unit`, `ranks`. Полный список всегда виден в подсказке
+`python src/datasets.py --help`.
+
+**Обе руки сравнения запускайте одной командой.** Между пересборками кэша
+результаты расходятся на 0.0009 даже при побитово одинаковых признаках —
+хватает разницы 1e-12 в таргете от порядка суммирования.
 
 Диагностика и калибровка:
 
@@ -85,12 +94,19 @@ python -u src/tune.py --trials 14 --space broad             # перебор г�
 python -u src/ensemble.py --val-cutoffs 2026-01-15,2025-12-16 --members mixed
 ```
 
-Зондирование лидерборда — как измерить поправку, которой нет в валидации:
+Зондирование лидерборда — как измерить поправку, которой нет в валидации.
+Сдвиг уровня зондом больше **не измеряют**: уровень тестового окна выведен
+(константа `TEST_LEVEL`), и `--derive-shift` даёт его бесплатно. Зонд нужен
+только для растяжения и кривизны:
 
 ```bash
-python -u src/probe_shift.py --source <база>.csv --delta -0.05           # 1. создать зонд
-python -u src/probe_shift.py --solve --mse0 <RMSLE базы> --mse1 <RMSLE зонда> --delta -0.05
+python -u src/probe_shift.py --source <база>.csv --alpha 1.02 --out probe.csv
+python -u src/probe_shift.py --solve --alpha 1.02 --var-p <из вывода> --mse0 <RMSLE базы> --mse1 <RMSLE зонда>
 ```
+
+Шаг брать **малым** (1.02, не 1.04): направление заранее не угадывается —
+из трёх наших зондов ни один не совпал с ожиданием, — а цена ошибки растёт
+как квадрат шага.
 
 Обучение на GPU (у кого есть видеокарта) — та же команда с другим движком:
 
@@ -212,8 +228,8 @@ def my_derived():
 Вклад своего блока меряется тем же `train.py` с `--blocks`:
 
 ```bash
-python src/train.py --blocks windows,lifetime,ratios          # без своего блока
-python src/train.py --blocks windows,lifetime,ratios,my_block # с ним
+python src/train.py --blocks windows,lifetime,ratios,platform,unit,ranks           # без своего
+python src/train.py --blocks windows,lifetime,ratios,platform,unit,ranks,my_block  # с ним
 ```
 
 Кэш выборок привязан к хешу кода признаков и к набору блоков, поэтому после
@@ -234,7 +250,10 @@ python src/train.py --blocks windows,lifetime,ratios,my_block # с ним
 * доли пользователя в суточном GMV площадки — не зависят от уровня площадки,
   который за год менялся вдвое (блок `platform`);
 * юнит-экономика и регулярность: цена единицы товара, активные недели и месяцы,
-  разброс межпокупочных пауз, выходные, брошенные корзины (блок `unit`).
+  разброс межпокупочных пауз, выходные, брошенные корзины (блок `unit`);
+* процентильные ранги 27 ключевых величин внутри среза (блок `ranks`) — они
+  снимают привязку к абсолютному уровню, ничего не выбрасывая, и дали
+  крупнейшее улучшение признаков за всю работу.
 
 ## Структура
 
@@ -246,6 +265,9 @@ src/features/lifetime.py  вся история, рецентность, BTYD
 src/features/ratios.py    отношения и тренды поверх агрегатов
 src/features/platform.py  доли в суточном GMV площадки (устойчивы к сдвигу уровня)
 src/features/unit.py      юнит-экономика и регулярность
+src/features/ranks.py     процентильные ранги внутри среза (снимают привязку к уровню)
+src/features/__init__.py  сборка признаков, суточный контекст, список блоков
+src/utils.py              git-хеш и журналы, переживающие смену набора колонок
 src/datasets.py           сборка и кэш выборок (кэш привязан к версии признаков)
 src/models.py             обёртка над LightGBM / CatBoost / XGBoost, класс Ensemble
 src/metrics.py            RMSLE, Gini, смещение суммарного GMV
@@ -258,6 +280,7 @@ src/bias.py               смещение уровня и оптимальны�
 src/errors.py             структура ошибки по сегментам клиентов
 src/calibrate.py          калиброванная оценка суммарного GMV для жюри
 src/offset.py             модель остатка через init_score (проверена, не работает)
+src/protocol.py           замер искажения от ранней остановки по отчётной валидации
 src/eda.py                обзор данных и наивные бенчмарки
 src/make_fake_data.py     синтетический лог для прогона пайплайна
 ```

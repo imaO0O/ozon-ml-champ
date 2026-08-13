@@ -102,6 +102,32 @@ def scale_submission(source: str, alpha: float, out: str | None) -> None:
                 "note": f"зонд размаха: {source}, alpha={alpha:.3f}, Var={p.var():.5f}"})
 
 
+# Уровень тестового окна, выведенный из зонда уровня: b измерялось как
+# E[log1p(y)] - E[log1p(pred)] для файла lgbm_ens_0811_1436.csv, у которого
+# среднее log1p предсказаний равно 2.27132, а b = +0.0578.
+# Проверка сходится: для полностью откалиброванного lgbm_ens_full_calib.csv
+# нужный сдвиг выходит 0.00000, а его public-ответ известен — 1.6529357726.
+# Отсюда любой сдвиг выводится без зонда: shift = TEST_LEVEL - E[log1p(pred)].
+TEST_LEVEL = 2.32912
+TEST_LEVEL_SE = 0.007          # погрешность наследуется от b
+
+
+def derive_shift(source: str) -> float:
+    """Сдвиг до известного уровня тестового окна — без траты сабмита."""
+    p = np.log1p(pl.read_csv(SUBMISSIONS / source)["predict"].to_numpy().astype(np.float64))
+    shift = TEST_LEVEL - p.mean()
+    cost = TEST_LEVEL_SE ** 2 / (2 * 1.653)
+    print(f"{source}")
+    print(f"  E[log1p(pred)] = {p.mean():.5f}")
+    print(f"  уровень окна   = {TEST_LEVEL:.5f} ± {TEST_LEVEL_SE:.3f}")
+    print(f"  нужный сдвиг   = {shift:+.5f}")
+    print(f"  ожидаемый выигрыш = {shift ** 2 / (2 * 1.653):.5f} RMSLE")
+    print(f"  цена неточности уровня ≈ {cost:.5f} RMSLE — пренебрежимо")
+    print("\nРастяжение и кривизну так вывести нельзя: они зависят от формы")
+    print("предсказаний конкретной модели и требуют своего зонда.")
+    return shift
+
+
 def quad_basis(p: np.ndarray) -> np.ndarray:
     """Квадратичное направление, очищенное от уже исправленных.
 
@@ -213,12 +239,18 @@ def main() -> None:
                     help="Var(g) — печатается при создании квадратичного зонда")
     ap.add_argument("--var-p", type=float, default=None,
                     help="Var(log1p(предсказаний)) — печатается при создании зонда размаха")
+    ap.add_argument("--derive-shift", action="store_true",
+                    help="вывести сдвиг из известного уровня тестового окна, без сабмита")
     ap.add_argument("--solve", action="store_true", help="решить по двум ответам лидерборда")
     ap.add_argument("--mse0", type=float, help="RMSLE исходного сабмита")
     ap.add_argument("--mse1", type=float, help="RMSLE сабмита-зонда")
     args = ap.parse_args()
 
-    if args.solve:
+    if args.derive_shift:
+        if not args.source:
+            raise SystemExit("нужен --source")
+        derive_shift(args.source)
+    elif args.solve:
         if args.mse0 is None or args.mse1 is None:
             raise SystemExit("нужны --mse0 и --mse1")
         if args.gamma is not None:

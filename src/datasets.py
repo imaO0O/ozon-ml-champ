@@ -29,18 +29,21 @@ def features_version(blocks: list[str] | None = None) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
-def dataset_path(cutoff: dt.date, blocks: list[str] | None = None):
-    # В имени — источник данных (синтетика/реальные) и версия кода признаков.
-    return DATA_PROC / f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}.parquet"
+def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None):
+    # В имени — источник данных (синтетика/реальные), версия кода признаков
+    # и глубина обрезки истории: с обрезкой и без неё это разные выборки.
+    tail = f"_h{history}" if history else ""
+    return (DATA_PROC /
+            f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}{tail}.parquet")
 
 
 def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
-                blocks: list[str] | None = None) -> pl.DataFrame:
-    path = dataset_path(cutoff, blocks)
+                blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks, history)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
-    df = build_dataset(cutoff, with_target=with_target, blocks=blocks)
+    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history)
     df.write_parquet(path)
     print(f"[{cutoff}] {df.height:,} строк x {df.width} колонок за {time.time() - t0:.1f}s -> {path.name}")
     return df
@@ -75,6 +78,8 @@ def main() -> None:
                     help=f"подмножество блоков через запятую (есть: {','.join(sorted(BLOCKS))})")
     ap.add_argument("--clean", action="store_true", help="удалить кэш прошлых версий признаков")
     ap.add_argument("--stride", type=int, default=None, help="шаг между срезами в днях")
+    ap.add_argument("--history", type=int, default=None,
+                    help="обрезать историю до K дней на всех срезах (одинаковая глубина)")
     args = ap.parse_args()
 
     blocks = parse_blocks(args.blocks)
@@ -83,9 +88,10 @@ def main() -> None:
     n = args.cutoffs if args.cutoffs is not None else None
     cuts = train_cutoffs(stride=args.stride) if n is None else train_cutoffs(n, args.stride)
     for c in cuts:
-        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks)
+        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks, history=args.history)
     if args.test:
-        get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks)
+        get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks,
+                    history=args.history)
 
 
 if __name__ == "__main__":
