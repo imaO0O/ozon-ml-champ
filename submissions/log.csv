@@ -25,3 +25,5 @@ gru_sh_f13_0812_1711.csv,2026-08-12T17:11:43,108460f+dirty,gru_sh_f13,gru,,1.688
 gru_sh_avg3.csv,2026-08-12T17:11:46,108460f+dirty,avg_seeds,avg,,,,,12073059,0.0000,,"среднее 3 сидов сети в log1p: gru_sh_f42_0812_1654.csv, gru_sh_f7_0812_1703.csv, gru_sh_f13_0812_1711.csv"
 blend_sh.csv,2026-08-12T17:11:48,108460f+dirty,blend_seq,blend,0.25,,,,10478649,0.0000,,"бленд в log1p: lgbm_ens_full_calib.csv и gru_sh_avg3.csv, вес сети 0.25; поправки калибровки не применялись"
 blend_sh_final.csv,2026-08-12T17:17:01,4e20fb8,probe,shift,,,,,9957652,0.0000,,зонд уровня: blend_sh.csv со сдвигом -0.050 в log1p
+probe_quad_blend.csv,2026-08-12T19:57:17,bb2f4cc,probe,quad,,,,,10892238,0.0000,,"зонд кривизны: blend_sh_final.csv, gamma=+0.02000, Var(g)=7.31789"
+probe_quad012.csv,2026-08-12T19:59:27,bb2f4cc+dirty,probe,quad,,,,,10491310,0.0000,,"зонд кривизны: blend_sh_final.csv, gamma=+0.01200, Var(g)=7.31789"
