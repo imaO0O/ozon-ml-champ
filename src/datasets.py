@@ -21,10 +21,18 @@ def features_version(blocks: list[str] | None = None) -> str:
 
     Без этого сокомандник, добавивший признак, молча обучится на старом кэше
     и решит, что его идея не работает. Пересборка стоит ~20 секунд на срез.
+
+    Переводы строк нормализуются: git на Windows подменяет LF на CRLF при
+    выгрузке, и без нормализации хеш менялся бы после каждого `git checkout`
+    или у сокомандника с другими настройками autocrlf — кэш пересобирался бы
+    впустую, а `feat_ver` в журналах выглядел бы разным при одинаковом коде.
     """
+    def norm(path: Path) -> bytes:
+        return path.read_bytes().replace(b"\r\n", b"\n")
+
     pkg = Path(__file__).with_name("features")
-    src = b"".join(p.read_bytes() for p in sorted(pkg.glob("*.py")))
-    src += Path(__file__).with_name("config.py").read_bytes()
+    src = b"".join(norm(p) for p in sorted(pkg.glob("*.py")))
+    src += norm(Path(__file__).with_name("config.py"))
     src += ("|".join(blocks) if blocks else "all").encode()
     return hashlib.md5(src).hexdigest()[:8]
 
