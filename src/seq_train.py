@@ -50,6 +50,7 @@ warnings.filterwarnings("ignore", message=".*Failed to find CUDA.*")
 
 from config import (HORIZON, MODELS, SAMPLE_SUBMIT, SEED, SUBMISSIONS, TEST_CUTOFF,
                     train_cutoffs)
+from datasets import get_dataset
 from features import build_target
 from metrics import report, rmse_log
 from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, gather, history_mask,
@@ -188,6 +189,41 @@ def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.nd
     return out
 
 
+def load_static(cutoff: dt.date, users: np.ndarray, rows: np.ndarray,
+                prefix: str = "rk_", with_target: bool = True):
+    """Статические признаки из выборки бустинга, выровненные по строкам матрицы.
+
+    Берутся только ранги: они уже лежат в [0, 1], не требуют масштабирования и
+    не зависят от уровня площадки. Абсолютные признаки сюда намеренно не идут —
+    иначе сеть превратится в медленную имитацию бустинга и потеряет то, ради
+    чего она в ансамбле, то есть непохожесть ошибок.
+
+    Пропуски (например ранг рецентности покупки у никогда не покупавшего)
+    кодируются как -1: ранги лежат в (0, 1], поэтому значение вне диапазона
+    сеть отличит от «самого низкого места».
+    """
+    df = get_dataset(cutoff, with_target=with_target)
+    cols = sorted(c for c in df.columns if c.startswith(prefix))
+    if not cols:
+        raise SystemExit(
+            f"в выборке на {cutoff} нет колонок с префиксом {prefix!r}. "
+            f"Блок ranks появился в main — пересоберите кэш: "
+            f"python -u src/datasets.py --test")
+    src_u = df["user_id"].to_numpy()
+    order = np.argsort(src_u)
+    su = src_u[order]
+    vals = df.select(cols).to_numpy().astype(np.float32)[order]
+    want = users[rows]
+    pos = np.clip(np.searchsorted(su, want), 0, len(su) - 1)
+    ok = su[pos] == want
+    out = np.full((len(want), len(cols)), -1.0, dtype=np.float32)
+    out[ok] = vals[pos[ok]]
+    out = np.nan_to_num(out, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    if (~ok).sum():
+        print(f"  {cutoff}: нет рангов для {(~ok).sum():,} пользователей — беру -1")
+    return out, cols
+
+
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
                   sample: int = 20000, seed: int = SEED, bin_days: int = 1):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
@@ -236,14 +272,15 @@ def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
 
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
-            bin_days: int = 1):
+            bin_days: int = 1, static: np.ndarray | None = None):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
         x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)
-        yield x, (None if y is None else y[take]), take
+        s = None if static is None else static[take]
+        yield x, s, (None if y is None else y[take]), take
 
 
 # --------------------------------------------------------------------------- модель
@@ -255,12 +292,21 @@ class SeqNet(nn.Module):
     перед cutoff'ом — рецентность решает в этой задаче больше всего) и среднее
     по всему окну (общий уровень клиента). Одного последнего состояния мало:
     у половины пользователей последние дни пустые.
+
+    Статическая ветка (`n_static > 0`) принимает процентильные ранги из блока
+    `ranks`. Для сети это не «ещё несколько признаков»: у неё до сих пор не было
+    никакой нормировки входа, устойчивой к сдвигу уровня площадки, а ранг такую
+    нормировку даёт даром — «верхние 5% по GMV» означают одно и то же на любом
+    срезе. Именно на этой привязке к абсолютным величинам сеть промахивалась
+    по уровню тестового окна на +0.20 против -0.058 у бустинга.
     """
 
     def __init__(self, n_ch: int, hidden: int = 128, layers: int = 1, arch: str = "gru",
-                 dropout: float = 0.1, lookback: int = 180, heads: int = 4):
+                 dropout: float = 0.1, lookback: int = 180, heads: int = 4,
+                 n_static: int = 0):
         super().__init__()
         self.arch = arch
+        self.n_static = n_static
         self.inp = nn.Sequential(nn.Linear(n_ch, hidden), nn.LayerNorm(hidden), nn.GELU())
         if arch in ("gru", "lstm"):
             cls = nn.GRU if arch == "gru" else nn.LSTM
@@ -275,35 +321,48 @@ class SeqNet(nn.Module):
             self.enc = nn.TransformerEncoder(layer, num_layers=layers)
         else:
             raise ValueError(f"неизвестная архитектура: {arch}")
+        head_in = hidden * 2
+        if n_static:
+            self.static = nn.Sequential(
+                nn.Linear(n_static, hidden), nn.LayerNorm(hidden), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(hidden, hidden), nn.GELU(),
+            )
+            head_in += hidden
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden * 2), nn.Linear(hidden * 2, hidden), nn.GELU(),
+            nn.LayerNorm(head_in), nn.Linear(head_in, hidden), nn.GELU(),
             nn.Dropout(dropout), nn.Linear(hidden, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
         h = self.inp(x)
         if self.arch == "transformer":
             h = self.enc(h + self.pos[:, -h.shape[1]:])
         else:
             h, _ = self.enc(h)
         pooled = torch.cat([h[:, -1], h.mean(dim=1)], dim=1)
+        if self.n_static:
+            if s is None:
+                raise ValueError("модель ждёт статические признаки, а их не подали")
+            pooled = torch.cat([pooled, self.static(s)], dim=1)
         return self.head(pooled).squeeze(-1)
 
 
 # --------------------------------------------------------------------------- обучение
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
-             desc: str = "предсказание", bin_days: int = 1):
+             desc: str = "предсказание", bin_days: int = 1, static=None):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
     prog = Progress(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
-        for i, (x, _, take) in enumerate(
-                batches(seq, rows, cutoff, lookback, batch_size, bin_days=bin_days), 1):
+        for i, (x, s, _, take) in enumerate(
+                batches(seq, rows, cutoff, lookback, batch_size, bin_days=bin_days,
+                        static=static), 1):
             xb = to_device(x, mean, std, device)
+            sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
-                p = model(xb)
+                p = model(xb, sb)
             out[take] = p.float().cpu().numpy()
             prog.update(i)
     prog.close()
@@ -318,7 +377,7 @@ def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
 
 def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, args,
                 mean, std, device, epochs: int | None = None,
-                train_base=None, val_base=None):
+                train_base=None, val_base=None, train_static=None, val_static=None):
     """Обучение с ранней остановкой по валидации; возвращает (модель, эпохи, история).
 
     Если `val_rows` пуст — это финальное дообучение: остановка по числу эпох,
@@ -327,12 +386,13 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     """
     torch.manual_seed(args.seed)
     steps = args.lookback // args.bin
+    n_static = 0 if train_static is None else train_static[0].shape[1]
     model = SeqNet(len(CHANNELS) + 1, args.hidden, args.layers, args.arch,
-                   args.dropout, steps).to(device)
+                   args.dropout, steps, args.heads, n_static).to(device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней "
-          f"= {steps} шагов по {args.bin} дн. | {len(CHANNELS) + 1} каналов | "
-          f"устройство {device}")
+          f"= {steps} шагов по {args.bin} дн. | {len(CHANNELS) + 1} каналов"
+          f"{f' + {n_static} рангов' if n_static else ''} | устройство {device}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # Шаги считаются посрезово: батчи не смешивают срезы, поэтому хвостовой
@@ -355,12 +415,15 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             cut, rows, y = train_cuts[ci], train_rows[ci], train_y[ci]
             # В режиме остатка целью становится то, чего бустингу не хватило.
             ylog = np.log1p(y) if train_base is None else np.log1p(y) - train_base[ci]
-            for x, yb, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                    ylog, shuffle=True, rng=rng, bin_days=args.bin):
+            st = None if train_static is None else train_static[ci]
+            for x, s, yb, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
+                                       ylog, shuffle=True, rng=rng, bin_days=args.bin,
+                                       static=st):
                 xb = to_device(x, mean, std, device)
+                sb = None if s is None else torch.from_numpy(s).float().to(device)
                 tb = torch.from_numpy(yb).float().to(device)
                 with autocast(device):
-                    loss = nn.functional.mse_loss(model(xb), tb)
+                    loss = nn.functional.mse_loss(model(xb, sb), tb)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -377,7 +440,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
         if len(val_rows):
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                          mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация",
-                         bin_days=args.bin)
+                         bin_days=args.bin, static=val_static)
             if val_base is not None:
                 p = val_base + p          # метрика считается по полному предсказанию
             score = rmse_log(np.log1p(val_y), p)
@@ -411,11 +474,15 @@ def predict_empty(model, args, mean, std, device) -> float:
     model.eval()
     with torch.no_grad():
         xb = to_device(x, mean, std, device)
+        # Ранги такого клиента нулевые: он в самом низу любого распределения.
+        sb = (None if not model.n_static else
+              torch.zeros((1, model.n_static), dtype=torch.float32, device=device))
         with autocast(device):
-            return float(model(xb).float().cpu().numpy()[0])
+            return float(model(xb, sb).float().cpu().numpy()[0])
 
 
-def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict) -> None:
+def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict,
+                    static=None) -> None:
     """Сабмит на 250k пользователей из sample_submit тем же форматом, что predict.py."""
     sub_users = pl.read_csv(SAMPLE_SUBMIT)["user_id"].to_numpy()
     pos = np.searchsorted(users, sub_users)
@@ -427,7 +494,7 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
 
     rows = pos.copy()
     p_log = evaluate(model, seq, rows, TEST_CUTOFF, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin)
+                     mean, std, device, bin_days=args.bin, static=static)
     # У неизвестных пользователей searchsorted указал на чужую строку — им
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
@@ -511,6 +578,11 @@ def main() -> None:
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val и собрать сабмит")
     ap.add_argument("--out", default=None, help="имя файла сабмита")
+    ap.add_argument("--static", default=None,
+                    help="подать сети статические признаки по префиксу колонок "
+                         "(например rk_ — процентильные ранги из блока ranks). "
+                         "Для сети это первая нормировка входа, устойчивая к сдвигу "
+                         "уровня площадки; нужен кэш признаков из datasets.py")
     ap.add_argument("--residual", default=None,
                     help="учить остаток бустинга: имя набора из seq_oof.py (например oof). "
                          "Выход сети по построению ортогонален тому, что бустинг уже умеет")
@@ -573,6 +645,16 @@ def main() -> None:
     print(f"  валидация {val_cut}: {len(val_rows):,} пользователей | "
           f"покупателей {(val_y > 0).mean():.2%}")
 
+    train_static = val_static = None
+    if args.static:
+        train_static, cols = [], None
+        for c, r in zip(train_cuts, train_rows):
+            s, cols = load_static(c, users, r, args.static)
+            train_static.append(s)
+        val_static, _ = load_static(val_cut, users, val_rows, args.static)
+        print(f"статические признаки: {len(cols)} колонок по префиксу '{args.static}' "
+              f"({', '.join(cols[:4])}, ...)")
+
     train_base = val_base = None
     if args.residual:
         print(f"режим остатка: цель = log1p(y) - предсказание бустинга ({args.residual})")
@@ -594,10 +676,11 @@ def main() -> None:
 
     model, best_epoch, _ = train_model(seq, train_rows, train_y, train_cuts,
                                        val_rows, val_y, val_cut, args, mean, std, device,
-                                       train_base=train_base, val_base=val_base)
+                                       train_base=train_base, val_base=val_base,
+                                       train_static=train_static, val_static=val_static)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin)
+                     mean, std, device, bin_days=args.bin, static=val_static)
     print(f"\n--- валидация (cutoff {val_cut}) ---")
     if val_base is not None:
         report(val_y, np.expm1(np.clip(val_base, 0, None)), "бустинг")
@@ -634,6 +717,8 @@ def main() -> None:
                  + (args.note or f"{args.arch} hidden={args.hidden} layers={args.layers} "
                                  f"lookback={args.lookback} bin={args.bin} "
                                  f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                 + (f" +static:{args.static}" if args.static else "")
+                 + (f" +residual:{args.residual}" if args.residual else "")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
     })
 
@@ -650,9 +735,11 @@ def main() -> None:
     all_rows = [*train_rows, val_rows]
     all_y = [*train_y, val_y]
     all_base = None if train_base is None else [*train_base, val_base]
+    all_static = None if train_static is None else [*train_static, val_static]
     final, _, _ = train_model(seq, all_rows, all_y, all_cuts, np.array([], dtype=int),
                               np.array([]), val_cut, args, mean, std, device,
-                              epochs=best_epoch, train_base=all_base)
+                              epochs=best_epoch, train_base=all_base,
+                              train_static=all_static)
 
     ckpt = MODELS / f"{args.name}_{args.arch}.pt"
     torch.save({"state_dict": final.state_dict(), "mean": mean_np, "std": std_np,
@@ -664,7 +751,14 @@ def main() -> None:
         encoding="utf-8")
     print(f"веса: {ckpt}")
 
-    make_submission(final, seq, users, first_day, args, mean, std, device, res)
+    test_static = None
+    if args.static:
+        sub_users = pl.read_csv(SAMPLE_SUBMIT)["user_id"].to_numpy()
+        rows_test = np.clip(np.searchsorted(users, sub_users), 0, len(users) - 1)
+        test_static, _ = load_static(TEST_CUTOFF, users, rows_test, args.static,
+                                     with_target=False)
+    make_submission(final, seq, users, first_day, args, mean, std, device, res,
+                    static=test_static)
 
 
 if __name__ == "__main__":
