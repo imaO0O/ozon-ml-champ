@@ -62,10 +62,15 @@ def feature_names(df: pl.DataFrame) -> list[str]:
 
 
 def clean_stale_cache(keep: str) -> None:
-    """Удалить выборки прошлых версий признаков — каждая версия весит ~360 МБ."""
+    """Удалить выборки прошлых версий признаков — каждая версия весит ~400 МБ.
+
+    Версия ищется в любом месте имени, а не только в конце: у выборок,
+    собранных с --history, после хеша стоит суффикс вида `_h229`, и проверка
+    по окончанию имени сносила их всегда, сколько бы раз их ни пересобирали.
+    """
     freed = 0
     for p in DATA_PROC.glob("ds_*.parquet"):
-        if p.stem.endswith(keep):
+        if keep in p.stem:
             continue
         freed += p.stat().st_size
         p.unlink()

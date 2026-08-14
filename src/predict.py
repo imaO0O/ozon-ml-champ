@@ -51,7 +51,16 @@ def main() -> None:
     ap.add_argument("--note", default="", help="комментарий для журнала сабмитов")
     args = ap.parse_args()
 
-    meta = json.loads((MODELS / f"{args.name}_meta.json").read_text(encoding="utf-8"))
+    # Мета создаётся только вместе с весами, то есть под --final. Без неё
+    # прежняя проверка была недостижима: чтение падало трейсбеком строкой выше.
+    meta_path = MODELS / f"{args.name}_meta.json"
+    if not meta_path.exists():
+        have = sorted(p.stem[:-5] for p in MODELS.glob("*_meta.json"))
+        raise SystemExit(
+            f"нет моделей с именем '{args.name}': обучите их командой "
+            f"train.py --final --name {args.name}"
+            + (f"\nготовые имена: {', '.join(have)}" if have else ""))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not meta.get("final"):
         raise SystemExit(f"модели '{args.name}' обучены без --final, для сабмита переобучите train.py --final")
     features, w = meta["features"], meta["blend_w"]
