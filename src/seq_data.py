@@ -32,6 +32,7 @@ import time
 
 import numpy as np
 import polars as pl
+from tqdm.auto import tqdm
 
 from config import DATA_END, DATA_PROC, DATA_START, TRAIN_PARQUET
 from features import scan_log
@@ -156,6 +157,10 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
 
     edges = np.linspace(0, n_users, chunks + 1).astype(np.int64)
     rows_total = 0
+    # disable=None — tqdm гасит себя, когда вывод не в терминал: сборка часто
+    # запускается фоном, и в логе возвраты каретки только мешают.
+    prog = tqdm(total=chunks, desc="  сборка матрицы", unit="кусок", disable=None,
+                leave=False, dynamic_ncols=True)
     for i in range(chunks):
         lo, hi = int(edges[i]), int(edges[i + 1])
         if lo == hi:
@@ -183,9 +188,11 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
         vals = df.select(CHANNELS).to_numpy().astype(np.float16)
         arr[ui, di] = vals
         rows_total += df.height
-        print(f"  [{i + 1}/{chunks}] пользователи {lo:,}..{hi:,} | строк {df.height:,}")
+        prog.set_postfix_str(f"пользователи {lo:,}..{hi:,}, строк {df.height:,}")
+        prog.update(1)
         del df, ui, di, vals
 
+    prog.close()
     arr.flush()
     np.savez(meta_path, users=users, first_day=first_day, last_day=last_day,
              channels=np.array(CHANNELS), n_days=N_DAYS)
