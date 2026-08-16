@@ -109,11 +109,13 @@ def build_dataset(cutoff: dt.date, with_target: bool = True,
         feat_lf = lf.filter(pl.col("event_date") >= cutoff - dt.timedelta(days=history))
     df = build_features(cutoff, feat_lf, blocks=blocks)
     if net:
-        # Предсказание сети из внешних файлов — не выражение над логом,
-        # поэтому подключается здесь, а не блоком реестра.
+        # Предсказания сетей из внешних файлов — не выражения над логом,
+        # поэтому подключаются здесь, а не блоком реестра.
+        # net может быть True (одна безымянная сеть) или списком имён.
         from .net import attach as attach_net  # noqa: PLC0415
 
-        df = attach_net(df, cutoff, TEST_CUTOFF)
+        names = None if net is True else list(net)
+        df = attach_net(df, cutoff, TEST_CUTOFF, names=names)
     if with_target:
         tgt = build_target(cutoff, lf)
         df = df.join(tgt, on="user_id", how="left").with_columns(

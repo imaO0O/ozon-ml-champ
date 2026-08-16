@@ -42,7 +42,9 @@ def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int 
     # В имени — источник данных (синтетика/реальные), версия кода признаков,
     # глубина обрезки истории и наличие признаков сети: это разные выборки.
     tail = f"_h{history}" if history else ""
-    tail += "_net" if net else ""
+    if net:
+        # Имена сетей входят в ключ: выборка с одной сетью и с тремя — разные.
+        tail += "_net" if net is True else "_net-" + "-".join(net)
     return (DATA_PROC /
             f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}{tail}.parquet")
 
@@ -85,6 +87,13 @@ def parse_blocks(value: str | None) -> list[str] | None:
     return [b.strip() for b in value.split(",") if b.strip()] if value else None
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cutoffs", type=int, default=None, help="сколько обучающих cutoff'ов собрать")
@@ -96,6 +105,8 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=None, help="шаг между срезами в днях")
     ap.add_argument("--net", action="store_true",
                     help="признак предсказания сети (features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах (одинаковая глубина)")
     args = ap.parse_args()
@@ -107,10 +118,10 @@ def main() -> None:
     cuts = train_cutoffs(stride=args.stride) if n is None else train_cutoffs(n, args.stride)
     for c in cuts:
         get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks,
-                    history=args.history, net=args.net)
+                    history=args.history, net=parse_net(args.net, args.net_names))
     if args.test:
         get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks,
-                    history=args.history, net=args.net)
+                    history=args.history, net=parse_net(args.net, args.net_names))
 
 
 if __name__ == "__main__":

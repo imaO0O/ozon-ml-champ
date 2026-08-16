@@ -123,6 +123,13 @@ def two_stage_predict(clf: GBM, reg: GBM, X) -> np.ndarray:
     return clf.predict(X) * reg.predict(X)
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lgbm", choices=["lgbm", "cat", "xgb"])
@@ -149,6 +156,8 @@ def main() -> None:
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
     ap.add_argument("--net", action="store_true",
                     help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -158,7 +167,7 @@ def main() -> None:
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
-                                         stride=args.stride, net=args.net)
+                                         stride=args.stride, net=parse_net(args.net, args.net_names))
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -210,7 +219,7 @@ def main() -> None:
         "name": name, "model": args.model, "device": args.device,
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
         "metrics": res, "seed": SEED, "features_version": features_version(blocks),
-        "blocks": blocks or "all", "net": args.net,
+        "blocks": blocks or "all", "net": parse_net(args.net, args.net_names),
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
 

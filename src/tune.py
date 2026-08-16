@@ -82,6 +82,13 @@ def parse_params(text: str) -> dict:
     return out
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=24)
@@ -92,6 +99,8 @@ def main() -> None:
     ap.add_argument("--blocks", default=None)
     ap.add_argument("--net", action="store_true",
                     help="признак предсказания сети (features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах")
     ap.add_argument("--seed", type=int, default=SEED)
@@ -111,7 +120,7 @@ def main() -> None:
 
     val_cutoff = dt.date.fromisoformat(args.val_cutoff) if args.val_cutoff else None
     train, val, feats, cuts = load_split(args.cutoffs, blocks=parse_blocks(args.blocks),
-                                         val_cutoff=val_cutoff, history=args.history, net=args.net)
+                                         val_cutoff=val_cutoff, history=args.history, net=parse_net(args.net, args.net_names))
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
