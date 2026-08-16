@@ -54,7 +54,11 @@ def main() -> None:
     ap.add_argument("--name", default="netoof", help="префикс выходных .npz")
     ap.add_argument("--lookback", type=int, default=90)
     ap.add_argument("--arch", default="gru")
-    ap.add_argument("--static", default="rk_")
+    # PowerShell выбрасывает пустую строку из аргументов нативной программы,
+    # поэтому «без статических признаков» задаётся словом, а не `--static ""`.
+    # Та же причина, по которой в tune.py появился разбор пар вместо JSON.
+    ap.add_argument("--static", default="rk_",
+                    help="префикс статических признаков; none или - означает «без них»")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--seeds", default="42",
                     help="сиды через запятую; предсказания усредняются в log1p-шкале. "
@@ -70,6 +74,10 @@ def main() -> None:
 
     cuts = train_cutoffs(args.cutoffs)
     print(f"срезы для выгрузки: {', '.join(str(c) for c in cuts)}")
+
+    if args.static and args.static.strip().lower() in ("none", "-", "нет"):
+        args.static = ""
+    print(f"статические признаки: {args.static or 'не подаются'}")
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     print(f"сидов на срез: {len(seeds)} ({', '.join(map(str, seeds))})")
