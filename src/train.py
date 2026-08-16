@@ -28,7 +28,7 @@ from utils import append_csv, git_commit
 
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
-               stride: int | None = None, history: int | None = None):
+               stride: int | None = None, history: int | None = None, net: bool = False):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -51,8 +51,9 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     if not train_cuts:
         raise SystemExit(f"нет обучающих срезов раньше {latest_ok}: увеличьте --cutoffs")
     cuts = [val_cut, *train_cuts]
-    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history)
-    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history) for c in train_cuts]
+    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history, net=net)
+    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history, net=net)
+              for c in train_cuts]
     feats = feature_names(val)
     # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
     # feats берётся из колонок val, поэтому в X эта колонка не попадёт.
@@ -146,6 +147,8 @@ def main() -> None:
                     help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
     ap.add_argument("--members", default="lgb",
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
+    ap.add_argument("--net", action="store_true",
+                    help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -155,7 +158,7 @@ def main() -> None:
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
-                                         stride=args.stride)
+                                         stride=args.stride, net=args.net)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)

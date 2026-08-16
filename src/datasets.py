@@ -37,21 +37,24 @@ def features_version(blocks: list[str] | None = None) -> str:
     return hashlib.md5(src).hexdigest()[:8]
 
 
-def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None):
-    # В имени — источник данных (синтетика/реальные), версия кода признаков
-    # и глубина обрезки истории: с обрезкой и без неё это разные выборки.
+def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None,
+                 net: bool = False):
+    # В имени — источник данных (синтетика/реальные), версия кода признаков,
+    # глубина обрезки истории и наличие признаков сети: это разные выборки.
     tail = f"_h{history}" if history else ""
+    tail += "_net" if net else ""
     return (DATA_PROC /
             f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}{tail}.parquet")
 
 
 def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
-                blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
-    path = dataset_path(cutoff, blocks, history)
+                blocks: list[str] | None = None, history: int | None = None,
+                net: bool = False) -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks, history, net)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
-    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history)
+    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history, net=net)
     df.write_parquet(path)
     print(f"[{cutoff}] {df.height:,} строк x {df.width} колонок за {time.time() - t0:.1f}s -> {path.name}")
     return df
@@ -91,6 +94,8 @@ def main() -> None:
                     help=f"подмножество блоков через запятую (есть: {','.join(sorted(BLOCKS))})")
     ap.add_argument("--clean", action="store_true", help="удалить кэш прошлых версий признаков")
     ap.add_argument("--stride", type=int, default=None, help="шаг между срезами в днях")
+    ap.add_argument("--net", action="store_true",
+                    help="признак предсказания сети (features/net.py)")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах (одинаковая глубина)")
     args = ap.parse_args()
@@ -101,10 +106,11 @@ def main() -> None:
     n = args.cutoffs if args.cutoffs is not None else None
     cuts = train_cutoffs(stride=args.stride) if n is None else train_cutoffs(n, args.stride)
     for c in cuts:
-        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks, history=args.history)
+        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks,
+                    history=args.history, net=args.net)
     if args.test:
         get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks,
-                    history=args.history)
+                    history=args.history, net=args.net)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ import datetime as dt
 
 import polars as pl
 
-from config import HORIZON, TRAIN_PARQUET
+from config import HORIZON, TEST_CUTOFF, TRAIN_PARQUET
 
 from .registry import BLOCKS, Block, aggs_block, derived_block, selected
 
@@ -90,7 +90,8 @@ def build_target(cutoff: dt.date, lf: pl.LazyFrame | None = None) -> pl.DataFram
 
 
 def build_dataset(cutoff: dt.date, with_target: bool = True,
-                  blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
+                  blocks: list[str] | None = None, history: int | None = None,
+                  net: bool = False) -> pl.DataFrame:
     """history — обрезать историю до одинаковой глубины на всех срезах.
 
     Данные начинаются 2025-01-01, поэтому у старого обучающего среза истории
@@ -107,6 +108,12 @@ def build_dataset(cutoff: dt.date, with_target: bool = True,
     if history:
         feat_lf = lf.filter(pl.col("event_date") >= cutoff - dt.timedelta(days=history))
     df = build_features(cutoff, feat_lf, blocks=blocks)
+    if net:
+        # Предсказание сети из внешних файлов — не выражение над логом,
+        # поэтому подключается здесь, а не блоком реестра.
+        from .net import attach as attach_net  # noqa: PLC0415
+
+        df = attach_net(df, cutoff, TEST_CUTOFF)
     if with_target:
         tgt = build_target(cutoff, lf)
         df = df.join(tgt, on="user_id", how="left").with_columns(

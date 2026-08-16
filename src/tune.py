@@ -90,6 +90,8 @@ def main() -> None:
     ap.add_argument("--early-stopping", type=int, default=300)
     ap.add_argument("--val-cutoff", default=None)
     ap.add_argument("--blocks", default=None)
+    ap.add_argument("--net", action="store_true",
+                    help="признак предсказания сети (features/net.py)")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах")
     ap.add_argument("--seed", type=int, default=SEED)
@@ -109,7 +111,7 @@ def main() -> None:
 
     val_cutoff = dt.date.fromisoformat(args.val_cutoff) if args.val_cutoff else None
     train, val, feats, cuts = load_split(args.cutoffs, blocks=parse_blocks(args.blocks),
-                                         val_cutoff=val_cutoff, history=args.history)
+                                         val_cutoff=val_cutoff, history=args.history, net=args.net)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
