@@ -52,3 +52,5 @@ gru_w90_f13_0813_1805.csv,2026-08-13T18:05:00,3ecabc5+dirty,gru_w90_f13,gru,,1.6
 gru_w90_avg3.csv,2026-08-13T18:05:39,3ecabc5+dirty,avg_seeds,avg,,,,,10872446,0.0000,,"среднее 3 сидов сети в log1p: gru_w90_f42_0813_1751.csv, gru_w90_f7_0813_1756.csv, gru_w90_f13_0813_1805.csv"
 mix4.csv,2026-08-13T18:05:46,3ecabc5+dirty,blend_seq,blend,0.54,,,,10929888,0.0000,,"бленд в log1p: lgbm_ranks_calib.csv и netsall.csv, вес сети 0.54; поправки калибровки не применялись"
 cand4.csv,2026-08-13T18:06:02,3ecabc5+dirty,probe,shift,,,,,10435380,0.0000,,зонд уровня: mix4.csv со сдвигом -0.045 в log1p
+cand4_a1015.csv,2026-08-16T18:42:05,f987777+dirty,probe,scale,,,,,10884445,0.0000,,"зонд размаха: cand4.csv, alpha=1.015, Var=2.60519"
+cand4_final.csv,2026-08-16T18:44:21,f987777+dirty,probe,scale,,,,,10647995,0.0000,,"зонд размаха: cand4.csv, alpha=1.007, Var=2.60519"
