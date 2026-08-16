@@ -210,7 +210,7 @@ def main() -> None:
         "name": name, "model": args.model, "device": args.device,
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
         "metrics": res, "seed": SEED, "features_version": features_version(blocks),
-        "blocks": blocks or "all",
+        "blocks": blocks or "all", "net": args.net,
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
 

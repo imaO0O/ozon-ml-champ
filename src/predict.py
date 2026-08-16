@@ -18,9 +18,12 @@ ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
 
 
 def build_test_frame(features: list[str], rebuild: bool = False,
-                     blocks: list[str] | None = None) -> tuple[pl.Series, np.ndarray]:
+                     blocks: list[str] | None = None,
+                     net: bool = False) -> tuple[pl.Series, np.ndarray]:
+    """net берётся из меты обучения: тестовая выборка должна собираться тем же
+    набором признаков, что и обучающая, иначе колонок просто не окажется."""
     users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
-    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks)
+    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks, net=net)
     df = users.join(feats, on="user_id", how="left")
     missing = df[features[0]].null_count()
     if missing:
@@ -67,7 +70,8 @@ def main() -> None:
     # Тестовые признаки собираем тем же набором блоков, что и обучающие.
     blocks = meta.get("blocks") if meta.get("blocks") != "all" else None
 
-    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks)
+    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks,
+                                  net=bool(meta.get("net")))
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
     reg = GBM.load(MODELS / f"{args.name}_reg.pkl")
