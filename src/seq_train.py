@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import sys
 import time
 import warnings
 
@@ -42,6 +41,7 @@ import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 # Triton ищет установленный CUDA Toolkit (nvcc), которого при обычной установке
 # torch нет и не нужно: torch.compile мы не используем, а сама CUDA-рантайм
@@ -83,47 +83,20 @@ def autocast(device):
                           enabled=_AMP and device.type == "cuda")
 
 
-class Progress:
-    """Однострочный индикатор хода работы.
+def bar(total: int, desc: str, unit: str = "батч"):
+    """Индикатор хода работы с общими для всего модуля настройками.
 
-    В терминале строка обновляется на месте через `\\r`, а при перенаправлении
-    вывода в файл печатается редкими обычными строками: иначе лог фонового
-    прогона превращается в одну бесконечную строку без переводов.
+    `disable=None` — ключевая настройка: tqdm сам выключается, когда вывод не
+    в терминал. Иначе лог фонового прогона превращается в одну бесконечную
+    строку с возвратами каретки, а именно так мы запускаем длинные выгрузки.
+
+    `leave=False` — по завершении строка стирается: итог печатается отдельной
+    строкой, и две записи об одном и том же в логе не нужны.
     """
-
-    def __init__(self, total: int, desc: str, width: int = 22):
-        self.total, self.desc, self.width = max(int(total), 1), desc, width
-        self.t0 = self.last = time.time()
-        self.tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
-        self.printed = 0
-
-    @staticmethod
-    def _hms(sec: float) -> str:
-        sec = int(max(sec, 0))
-        return f"{sec // 60}м{sec % 60:02d}с" if sec >= 60 else f"{sec}с"
-
-    def update(self, done: int, extra: str = "") -> None:
-        now = time.time()
-        # В терминале — до пяти раз в секунду, в файл — раз в 20 секунд.
-        if done < self.total and now - self.last < (0.2 if self.tty else 20.0):
-            return
-        self.last = now
-        frac = min(done / self.total, 1.0)
-        el = now - self.t0
-        eta = el / frac - el if frac > 1e-9 else 0.0
-        full = int(frac * self.width)
-        msg = (f"  {self.desc} [{'█' * full}{'·' * (self.width - full)}] "
-               f"{done}/{self.total} {self._hms(el)}<{self._hms(eta)}{extra}")
-        if self.tty:
-            print("\r" + msg + " " * max(0, self.printed - len(msg)), end="", flush=True)
-            self.printed = len(msg)
-        else:
-            print(msg, flush=True)
-
-    def close(self) -> None:
-        if self.tty and self.printed:
-            print("\r" + " " * self.printed + "\r", end="", flush=True)
-        self.printed = 0
+    return tqdm(total=max(int(total), 1), desc=desc, unit=unit, disable=None,
+                leave=False, dynamic_ncols=True, mininterval=0.3,
+                bar_format="  {desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                           "[{elapsed}<{remaining}{postfix}]")
 
 
 # --------------------------------------------------------------------------- данные
@@ -354,17 +327,16 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
-    prog = Progress(-(-len(rows) // batch_size), desc)
+    prog = bar(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
-        for i, (x, s, _, take) in enumerate(
-                batches(seq, rows, cutoff, lookback, batch_size, bin_days=bin_days,
-                        static=static), 1):
+        for x, s, _, take in batches(seq, rows, cutoff, lookback, batch_size,
+                                     bin_days=bin_days, static=static):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
                 p = model(xb, sb)
             out[take] = p.float().cpu().numpy()
-            prog.update(i)
+            prog.update(1)
     prog.close()
     return out
 
@@ -408,7 +380,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     for epoch in range(1, n_epochs + 1):
         model.train()
         t0, run, seen, done = time.time(), 0.0, 0, 0
-        prog = Progress(steps, f"эпоха {epoch}/{n_epochs}")
+        prog = bar(steps, f"эпоха {epoch}/{n_epochs}")
         # Срезы перемешиваются целиком, а не построчно: батч из одного среза —
         # это и локальность memmap, и корректные окна (у срезов разные границы).
         for ci in rng.permutation(len(train_cuts)):
@@ -433,7 +405,9 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                 run += float(loss) * len(yb)
                 seen += len(yb)
                 done += 1
-                prog.update(done, f" | RMSE {np.sqrt(run / seen):.4f}")
+                prog.update(1)
+                if done % 20 == 0:
+                    prog.set_postfix_str(f"RMSE {np.sqrt(run / seen):.4f}")
         prog.close()
 
         line = f"эпоха {epoch:>2}/{n_epochs} | train RMSE {np.sqrt(run / seen):.5f}"
