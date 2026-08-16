@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import shutil
+
 import subprocess
 import sys
 import time
@@ -56,7 +56,10 @@ def main() -> None:
     ap.add_argument("--arch", default="gru")
     ap.add_argument("--static", default="rk_")
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", default="42",
+                    help="сиды через запятую; предсказания усредняются в log1p-шкале. "
+                         "Обучающий признак должен быть такой же силы, что и тестовый, "
+                         "иначе бустинг учится доверять более слабой версии, чем получит")
     ap.add_argument("--cutoffs", type=int, default=6,
                     help="сколько срезов покрыть, начиная со свежего")
     ap.add_argument("--train-cutoffs", type=int, default=5,
@@ -68,33 +71,46 @@ def main() -> None:
     cuts = train_cutoffs(args.cutoffs)
     print(f"срезы для выгрузки: {', '.join(str(c) for c in cuts)}")
 
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    print(f"сидов на срез: {len(seeds)} ({', '.join(map(str, seeds))})")
+
     for cut in cuts:
         out = MODELS / f"{args.name}_{cut}.npz"
         if out.exists():
             print(f"\n{cut}: уже есть {out.name}")
             continue
         n = older_count(cut, args.train_cutoffs)
-        tag = f"{args.name}_run_{cut}"
-        cmd = [sys.executable, "-u", str(SRC / "seq_train.py"),
-               "--arch", args.arch, "--epochs", str(args.epochs),
-               "--lookback", str(args.lookback), "--seed", str(args.seed),
-               "--cutoffs", str(n), "--val-cutoff", str(cut),
-               "--save-val-pred", "--name", tag,
-               "--note", f"walk-forward для стекинга, срез {cut}"]
-        if args.static:
-            cmd += ["--static", args.static]
         print(f"\n=== {cut}: обучение на {args.train_cutoffs} более старых срезах ===")
         t0 = time.time()
-        r = subprocess.run(cmd, cwd=SRC.parent)
-        if r.returncode != 0:
-            raise SystemExit(f"прогон на {cut} завершился с ошибкой")
-        src = MODELS / f"{tag}_valpred_{cut}.npz"
-        if not src.exists():
-            raise SystemExit(f"не найден {src.name}")
-        shutil.move(str(src), str(out))
-        d = np.load(out)
-        print(f"  -> {out.name} | {len(d['user_id']):,} пользователей | "
-              f"{time.time() - t0:.0f}s")
+        parts = []
+        for sd in seeds:
+            tag = f"{args.name}_s{sd}_{cut}"
+            src = MODELS / f"{tag}_valpred_{cut}.npz"
+            if not src.exists():
+                cmd = [sys.executable, "-u", str(SRC / "seq_train.py"),
+                       "--arch", args.arch, "--epochs", str(args.epochs),
+                       "--lookback", str(args.lookback), "--seed", str(sd),
+                       "--cutoffs", str(n), "--val-cutoff", str(cut),
+                       "--save-val-pred", "--name", tag,
+                       "--note", f"walk-forward для стекинга, срез {cut}, сид {sd}"]
+                if args.static:
+                    cmd += ["--static", args.static]
+                if subprocess.run(cmd, cwd=SRC.parent).returncode != 0:
+                    raise SystemExit(f"прогон на {cut}, сид {sd} завершился с ошибкой")
+            if not src.exists():
+                raise SystemExit(f"не найден {src.name}")
+            parts.append(np.load(src))
+
+        base = parts[0]
+        for q in parts[1:]:
+            if not np.array_equal(q["user_id"], base["user_id"]):
+                raise SystemExit(f"{cut}: наборы пользователей у сидов различаются")
+        # Усреднение в log1p-шкале — там же, где складываются участники ансамбля.
+        pred = np.mean([q["pred_log"] for q in parts], axis=0)
+        np.savez(out, user_id=base["user_id"], pred_log=pred, target=base["target"])
+        spread = float(np.std([q["pred_log"].mean() for q in parts]))
+        print(f"  -> {out.name} | {len(pred):,} пользователей | сидов {len(parts)} | "
+              f"разброс средних по сидам {spread:.5f} | {time.time() - t0:.0f}s")
 
     if args.test_submission:
         import polars as pl
