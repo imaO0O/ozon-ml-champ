@@ -1,0 +1,115 @@
+"""Out-of-fold предсказания СЕТИ по всем срезам — вход для стекинга у трека A.
+
+Зачем. Сейчас сеть и бустинг соединяются блендом: взвешенная сумма с одним
+весом на всех клиентов. Стекинг устроен иначе — бустинг получает предсказание
+сети обычным признаком и сам учится, где ему доверять. Взвешенная сумма так
+не умеет.
+
+Критично, как именно получены предсказания. Если дать бустингу предсказания
+сети на тех же срезах, на которых сеть обучалась, он выучит утечку: на
+валидации будет прекрасно, на лидерборде провал. Поэтому здесь та же схема
+walk-forward, что в `seq_oof.py` для бустинга: для среза `c` сеть обучается
+на срезах **строго старше** `c` и предсказывает `c`, ни разу его не увидев.
+
+Тест устроен так же, как в рабочем сабмите: сеть, обученная на всех срезах,
+предсказывает TEST_CUTOFF. Этот файл берётся готовым из усреднённых сабмитов
+(`--test-submission`), потому что там уже усреднены сиды.
+
+    python -u src/seq_oof_net.py --lookback 90 --static rk_ --name netoof
+    python -u src/seq_oof_net.py --name netoof --test-submission gru_w90_avg3.csv
+
+Результат: `models/<name>_<cutoff>.npz` с полями user_id, pred_log, target —
+тот же формат, что у `seq_oof.py`, чтобы трек A читал оба одинаково.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+from config import HORIZON, MODELS, SUBMISSIONS, TEST_CUTOFF, train_cutoffs
+
+SRC = Path(__file__).resolve().parent
+
+
+def older_count(cut: dt.date, want: int) -> int:
+    """Сколько срезов запросить у train_cutoffs, чтобы у `cut` было `want` предшественников.
+
+    Срезы идут с шагом 30 дней от 2026-01-15, поэтому позиция `cut` в списке
+    считается напрямую, а к ней добавляется нужное число более старых.
+    """
+    newest = train_cutoffs(1)[0]
+    pos = (newest - cut).days // HORIZON
+    return pos + 1 + want
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", default="netoof", help="префикс выходных .npz")
+    ap.add_argument("--lookback", type=int, default=90)
+    ap.add_argument("--arch", default="gru")
+    ap.add_argument("--static", default="rk_")
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cutoffs", type=int, default=6,
+                    help="сколько срезов покрыть, начиная со свежего")
+    ap.add_argument("--train-cutoffs", type=int, default=5,
+                    help="сколько более старых срезов давать сети на каждый прогон")
+    ap.add_argument("--test-submission", default=None,
+                    help="готовый сабмит сети (усреднённый по сидам) -> <name>_test.npz")
+    args = ap.parse_args()
+
+    cuts = train_cutoffs(args.cutoffs)
+    print(f"срезы для выгрузки: {', '.join(str(c) for c in cuts)}")
+
+    for cut in cuts:
+        out = MODELS / f"{args.name}_{cut}.npz"
+        if out.exists():
+            print(f"\n{cut}: уже есть {out.name}")
+            continue
+        n = older_count(cut, args.train_cutoffs)
+        tag = f"{args.name}_run_{cut}"
+        cmd = [sys.executable, "-u", str(SRC / "seq_train.py"),
+               "--arch", args.arch, "--epochs", str(args.epochs),
+               "--lookback", str(args.lookback), "--seed", str(args.seed),
+               "--cutoffs", str(n), "--val-cutoff", str(cut),
+               "--save-val-pred", "--name", tag,
+               "--note", f"walk-forward для стекинга, срез {cut}"]
+        if args.static:
+            cmd += ["--static", args.static]
+        print(f"\n=== {cut}: обучение на {args.train_cutoffs} более старых срезах ===")
+        t0 = time.time()
+        r = subprocess.run(cmd, cwd=SRC.parent)
+        if r.returncode != 0:
+            raise SystemExit(f"прогон на {cut} завершился с ошибкой")
+        src = MODELS / f"{tag}_valpred_{cut}.npz"
+        if not src.exists():
+            raise SystemExit(f"не найден {src.name}")
+        shutil.move(str(src), str(out))
+        d = np.load(out)
+        print(f"  -> {out.name} | {len(d['user_id']):,} пользователей | "
+              f"{time.time() - t0:.0f}s")
+
+    if args.test_submission:
+        import polars as pl
+
+        sub = pl.read_csv(SUBMISSIONS / args.test_submission)
+        p = np.log1p(sub["predict"].to_numpy().astype(np.float64))
+        out = MODELS / f"{args.name}_test.npz"
+        np.savez(out, user_id=sub["user_id"].to_numpy(), pred_log=p)
+        print(f"\nтест ({TEST_CUTOFF}) из {args.test_submission} -> {out.name} | "
+              f"{len(p):,} пользователей | mean log1p {p.mean():.5f}")
+
+    print("\nГотово. Формат тот же, что у seq_oof.py: user_id, pred_log, target.")
+    print("ВАЖНО для стекинга: каждое предсказание получено сетью, которая этот срез")
+    print("не видела. Предсказания с обучающих срезов дали бы утечку.")
+
+
+if __name__ == "__main__":
+    main()
