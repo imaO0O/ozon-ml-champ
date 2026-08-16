@@ -122,4 +122,5 @@ from . import lifetime  # noqa: E402,F401
 from . import ratios  # noqa: E402,F401
 from . import platform  # noqa: E402,F401
 from . import unit  # noqa: E402,F401
+from . import shape  # noqa: E402,F401
 from . import ranks  # noqa: E402,F401  (последним: ранжирует уже готовые признаки)
