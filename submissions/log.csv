@@ -27,4 +27,4 @@ probe_stack_a102.csv,2026-08-16T20:11:56,75a08fe+dirty,probe,scale,,,,,10052045,
 stack_calib.csv,2026-08-16T22:47:29,75a08fe+dirty,probe,scale,,,,,10716759,0.0000,1.6515847352,стекинг + сдвиг 0.0448 + растяжение 1.0437; ожидается 1.6515852
 stack3_0817_0012.csv,2026-08-17T00:12:30,c6a144b+dirty,stack3,lgbm,0.25,1.67948,0.7393,0.5216,9293351,0.0000,,"стекинг на трёхсидовом OOF, сырой"
 stack3_shifted.csv,2026-08-17T00:12:52,c6a144b+dirty,probe,shift,,,,,9691170,0.0000,,зонд уровня: stack3_0817_0012.csv со сдвигом +0.041 в log1p
-stack3_calib.csv,2026-08-17T00:13:23,c6a144b+dirty,probe,scale,,,,,10914018,0.0000,,"зонд размаха: stack3_shifted.csv, alpha=1.044, Var=2.42558"
+stack3_calib.csv,2026-08-17T00:13:23,c6a144b+dirty,probe,scale,,,,,10914018,0.0000,1.6517738882,"зонд размаха: stack3_shifted.csv, alpha=1.044, Var=2.42558"
