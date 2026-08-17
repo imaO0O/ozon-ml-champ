@@ -350,10 +350,15 @@ class SeqNet(nn.Module):
         # Выходов 1 + n_aux: первый — сумма за горизонт, остальные — подокна.
         # Дополнительные головы работают только на обучении.
         self.n_aux = n_aux
-        self.head = nn.Sequential(
+        # Голова разделена намеренно: `head_body` даёт скрытое состояние
+        # размерности hidden — то самое, которое организаторы предлагали отдать
+        # бустингу признаками. Предсказание есть его одномерная проекция, то
+        # есть строго беднее: всё, что не легло на эту ось, теряется.
+        self.head_body = nn.Sequential(
             nn.LayerNorm(head_in), nn.Linear(head_in, hidden), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(hidden, 1 + n_aux),
+            nn.Dropout(dropout),
         )
+        self.head_out = nn.Linear(hidden, 1 + n_aux)
 
     def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
         h = self.inp(x)
@@ -366,7 +371,26 @@ class SeqNet(nn.Module):
             if s is None:
                 raise ValueError("модель ждёт статические признаки, а их не подали")
             pooled = torch.cat([pooled, self.static(s)], dim=1)
-        return self.head(pooled)
+        return self.head_out(self.head_body(pooled))
+
+    def hidden(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
+        """Скрытое состояние перед последним слоем — вход для стекинга.
+
+        Тот же путь, что и в `forward`, но без проекции в число. Дублирование
+        кода здесь дешевле, чем флаг в `forward`: тот вызывается на каждом
+        батче обучения, и лишняя ветка в нём — лишний риск.
+        """
+        h = self.inp(x)
+        if self.arch == "transformer":
+            h = self.enc(h + self.pos[:, -h.shape[1]:])
+        else:
+            h, _ = self.enc(h)
+        pooled = torch.cat([h[:, -1], h.mean(dim=1)], dim=1)
+        if self.n_static:
+            if s is None:
+                raise ValueError("модель ждёт статические признаки, а их не подали")
+            pooled = torch.cat([pooled, self.static(s)], dim=1)
+        return self.head_body(pooled)
 
 
 # --------------------------------------------------------------------------- обучение
@@ -387,6 +411,33 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
             # Первый выход — основная голова. Остальные, если они есть, живут
             # только на обучении и в предсказание не идут.
             out[take] = p[:, 0].float().cpu().numpy()
+            prog.update(1)
+    prog.close()
+    return out
+
+
+def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
+                   bin_days: int = 1, static=None) -> np.ndarray:
+    """Скрытые состояния для всех строк — матрица (len(rows), hidden).
+
+    Хранится во float16: точность здесь не критична (бустинг всё равно режет
+    признаки на 255 корзин), а размер вчетверо меньше — 250 000 x 128 это
+    64 МБ вместо 256, и такие файлы ещё можно передать сокоманднику.
+    """
+    model.eval()
+    out = None
+    prog = bar(-(-len(rows) // batch_size), "скрытые состояния")
+    with torch.no_grad():
+        for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
+                                        bin_days=bin_days, static=static):
+            xb = to_device(x, mean, std, device)
+            sb = None if s is None else torch.from_numpy(s).float().to(device)
+            with autocast(device):
+                z = model.hidden(xb, sb)
+            z = z.float().cpu().numpy()
+            if out is None:
+                out = np.empty((len(rows), z.shape[1]), dtype=np.float16)
+            out[take] = z.astype(np.float16)
             prog.update(1)
     prog.close()
     return out
@@ -631,6 +682,10 @@ def main() -> None:
     ap.add_argument("--residual", default=None,
                     help="учить остаток бустинга: имя набора из seq_oof.py (например oof). "
                          "Выход сети по построению ортогонален тому, что бустинг уже умеет")
+    ap.add_argument("--save-hidden", action="store_true",
+                    help="сохранить скрытое состояние сети на валидации — вход для "
+                         "стекинга. Предсказание есть его одномерная проекция, то есть "
+                         "строго беднее: всё, что не легло на эту ось, теряется")
     ap.add_argument("--save-val-pred", action="store_true",
                     help="сохранить предсказания на валидации для бленда с бустингом")
     args = ap.parse_args()
@@ -749,6 +804,14 @@ def main() -> None:
         np.savez(MODELS / f"{args.name}_valpred_{val_cut}.npz",
                  user_id=users[val_rows], pred_log=p_log, target=val_y)
         print(f"предсказания валидации: {MODELS / f'{args.name}_valpred_{val_cut}.npz'}")
+
+    if args.save_hidden:
+        z = extract_hidden(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
+                           mean, std, device, bin_days=args.bin, static=val_static)
+        path = MODELS / f"{args.name}_hidden_{val_cut}.npz"
+        np.savez(path, user_id=users[val_rows], hidden=z, target=val_y)
+        print(f"скрытые состояния: {path} | {z.shape[0]:,} x {z.shape[1]} "
+              f"| {path.stat().st_size / 1024 ** 2:.0f} МБ")
 
     append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
         "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),

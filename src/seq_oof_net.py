@@ -68,6 +68,11 @@ def main() -> None:
                     help="сколько срезов покрыть, начиная со свежего")
     ap.add_argument("--train-cutoffs", type=int, default=5,
                     help="сколько более старых срезов давать сети на каждый прогон")
+    ap.add_argument("--hidden", action="store_true",
+                    help="выгружать скрытые состояния вместо предсказаний. "
+                         "Работает только с одним сидом: у разных сидов оси скрытого "
+                         "пространства свои, и усреднять их — всё равно что складывать "
+                         "координаты в разных системах отсчёта")
     ap.add_argument("--test-submission", default=None,
                     help="готовый сабмит сети (усреднённый по сидам) -> <name>_test.npz")
     args = ap.parse_args()
@@ -80,7 +85,12 @@ def main() -> None:
     print(f"статические признаки: {args.static or 'не подаются'}")
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
-    print(f"сидов на срез: {len(seeds)} ({', '.join(map(str, seeds))})")
+    if args.hidden and len(seeds) > 1:
+        raise SystemExit("--hidden работает с одним сидом: скрытые пространства "
+                         "разных сидов повёрнуты друг относительно друга, и их "
+                         "усреднение не имеет смысла")
+    print(f"сидов на срез: {len(seeds)} ({', '.join(map(str, seeds))})"
+          + (" | выгружаем скрытые состояния" if args.hidden else ""))
 
     for cut in cuts:
         out = MODELS / f"{args.name}_{cut}.npz"
@@ -93,7 +103,8 @@ def main() -> None:
         parts = []
         for sd in seeds:
             tag = f"{args.name}_s{sd}_{cut}"
-            src = MODELS / f"{tag}_valpred_{cut}.npz"
+            kind = "hidden" if args.hidden else "valpred"
+            src = MODELS / f"{tag}_{kind}_{cut}.npz"
             if not src.exists():
                 cmd = [sys.executable, "-u", str(SRC / "seq_train.py"),
                        "--arch", args.arch, "--epochs", str(args.epochs),
@@ -101,6 +112,8 @@ def main() -> None:
                        "--cutoffs", str(n), "--val-cutoff", str(cut),
                        "--save-val-pred", "--name", tag,
                        "--note", f"walk-forward для стекинга, срез {cut}, сид {sd}"]
+                if args.hidden:
+                    cmd += ["--save-hidden"]
                 if args.static:
                     cmd += ["--static", args.static]
                 if subprocess.run(cmd, cwd=SRC.parent).returncode != 0:
@@ -113,6 +126,13 @@ def main() -> None:
         for q in parts[1:]:
             if not np.array_equal(q["user_id"], base["user_id"]):
                 raise SystemExit(f"{cut}: наборы пользователей у сидов различаются")
+        if args.hidden:
+            np.savez(out, user_id=base["user_id"], hidden=base["hidden"],
+                     target=base["target"])
+            z = base["hidden"]
+            print(f"  -> {out.name} | {z.shape[0]:,} x {z.shape[1]} | "
+                  f"{out.stat().st_size / 1024 ** 2:.0f} МБ | {time.time() - t0:.0f}s")
+            continue
         # Усреднение в log1p-шкале — там же, где складываются участники ансамбля.
         pred = np.mean([q["pred_log"] for q in parts], axis=0)
         np.savez(out, user_id=base["user_id"], pred_log=pred, target=base["target"])
