@@ -37,10 +37,13 @@ import datetime as dt
 
 import numpy as np
 
+import lightgbm as lgb
+from tqdm.auto import tqdm
+
 from config import MODELS, train_cutoffs
 from ensemble import MEMBERS
 from metrics import report, rmse_log
-from models import GBM
+from models import LGB_REG
 from train import load_split, to_xy
 from utils import append_csv, git_commit
 
@@ -73,6 +76,46 @@ def leveled(y: np.ndarray, p: np.ndarray) -> np.ndarray:
     return p + grid[int(np.argmin([rmse_log(y, p + d) for d in grid]))]
 
 
+def iter_bar(desc: str):
+    """Счётчик итераций бустинга без общего числа.
+
+    Полоса с процентами здесь была бы враньём: обучение останавливает ранняя
+    остановка, а не потолок в 20 000 раундов, и реально уходит 140-400. Поэтому
+    счётчик со скоростью и текущей метрикой — честнее.
+    """
+    return tqdm(desc=desc, unit="итер", disable=None, leave=False, dynamic_ncols=True,
+                mininterval=0.5,
+                bar_format="    {desc}: {n_fmt} итераций [{elapsed}, {rate_fmt}{postfix}]")
+
+
+def fit_member(Xtr, ytr_log, Xva, yva_log, feats, params, rounds, desc):
+    """Один участник состава. Обучение повторяет путь GBM для lgbm/reg.
+
+    Вызывается не через `models.GBM` намеренно: тому нельзя передать свой
+    callback, а без него полтора часа прогона идут без единого признака жизни.
+    Параметры берутся из того же `LGB_REG`, поэтому разойтись с рабочей моделью
+    они не могут — локально только сам вызов обучения.
+    """
+    base = {**LGB_REG, **params}
+    dtrain = lgb.Dataset(Xtr, label=ytr_log, feature_name=feats)
+    dvalid = lgb.Dataset(Xva, label=yva_log, reference=dtrain)
+
+    prog = iter_bar(desc)
+
+    def on_iter(env):
+        prog.update(1)
+        if env.evaluation_result_list:
+            prog.set_postfix_str(f"rmse {env.evaluation_result_list[0][2]:.5f}")
+
+    on_iter.before_iteration = False
+    on_iter.order = 30
+    model = lgb.train(base, dtrain, num_boost_round=rounds, valid_sets=[dvalid],
+                      callbacks=[lgb.early_stopping(200, verbose=False), on_iter])
+    prog.close()
+    best = model.best_iteration or rounds
+    return model.predict(Xva, num_iteration=best), best
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", default="42,7,13,21,99",
@@ -103,16 +146,22 @@ def main() -> None:
         ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
 
         preds, curve = [], []
-        for i, (name, kind, params) in enumerate(plan, 1):
-            m = GBM(kind, "reg", "cpu", n_estimators=args.rounds, params=params,
-                    log_period=0)
-            m.fit(Xtr, ytr_log, Xva, yva_log, feature_names=feats)
-            preds.append(m.predict(Xva))
-            ens = np.mean(preds, axis=0)
-            score = rmse_log(yva_log, leveled(yva_log, ens))
+        outer = tqdm(total=len(plan), desc="  участники", unit="модель", disable=None,
+                     leave=False, dynamic_ncols=True,
+                     bar_format="  {desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                                "[{elapsed}<{remaining}{postfix}]")
+        for i, (name, _, params) in enumerate(plan, 1):
+            p, best = fit_member(Xtr, ytr_log, Xva, yva_log, feats, params,
+                                 args.rounds, f"[{i}/{len(plan)}] {name}")
+            preds.append(p)
+            score = rmse_log(yva_log, leveled(yva_log, np.mean(preds, axis=0)))
             curve.append(score)
-            print(f"  [{i:>2}] {name:<22} итераций {m.best_iter:>4} | "
-                  f"состав из {i:>2}: {score:.5f}")
+            outer.update(1)
+            outer.set_postfix_str(f"состав {score:.5f}")
+            # tqdm.write, а не print: обычная печать разорвала бы полосу.
+            tqdm.write(f"  [{i:>2}] {name:<22} итераций {best:>4} | "
+                       f"состав из {i:>2}: {score:.5f}")
+        outer.close()
 
         print(f"\n  кривая по размеру состава (выровненный уровень):")
         base5 = curve[4] if len(curve) >= 5 else None
