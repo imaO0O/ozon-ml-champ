@@ -91,7 +91,7 @@ def build_target(cutoff: dt.date, lf: pl.LazyFrame | None = None) -> pl.DataFram
 
 def build_dataset(cutoff: dt.date, with_target: bool = True,
                   blocks: list[str] | None = None, history: int | None = None,
-                  net: bool = False) -> pl.DataFrame:
+                  net: bool = False, net_feats: str = "rank_centered") -> pl.DataFrame:
     """history — обрезать историю до одинаковой глубины на всех срезах.
 
     Данные начинаются 2025-01-01, поэтому у старого обучающего среза истории
@@ -115,7 +115,7 @@ def build_dataset(cutoff: dt.date, with_target: bool = True,
         from .net import attach as attach_net  # noqa: PLC0415
 
         names = None if net is True else list(net)
-        df = attach_net(df, cutoff, TEST_CUTOFF, names=names)
+        df = attach_net(df, cutoff, TEST_CUTOFF, names=names, feats=net_feats)
     if with_target:
         tgt = build_target(cutoff, lf)
         df = df.join(tgt, on="user_id", how="left").with_columns(

@@ -38,25 +38,29 @@ def features_version(blocks: list[str] | None = None) -> str:
 
 
 def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None,
-                 net: bool = False):
+                 net: bool = False, net_feats: str = "rank_centered"):
     # В имени — источник данных (синтетика/реальные), версия кода признаков,
     # глубина обрезки истории и наличие признаков сети: это разные выборки.
     tail = f"_h{history}" if history else ""
     if net:
         # Имена сетей входят в ключ: выборка с одной сетью и с тремя — разные.
         tail += "_net" if net is True else "_net-" + "-".join(net)
+        # Набор признаков сети тоже: с уровнем и без — разные выборки.
+        if net_feats != "rank_centered":
+            tail += f"-{net_feats}"
     return (DATA_PROC /
             f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}{tail}.parquet")
 
 
 def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
                 blocks: list[str] | None = None, history: int | None = None,
-                net: bool = False) -> pl.DataFrame:
-    path = dataset_path(cutoff, blocks, history, net)
+                net: bool = False, net_feats: str = "rank_centered") -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks, history, net, net_feats)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
-    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history, net=net)
+    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history,
+                       net=net, net_feats=net_feats)
     df.write_parquet(path)
     print(f"[{cutoff}] {df.height:,} строк x {df.width} колонок за {time.time() - t0:.1f}s -> {path.name}")
     return df
