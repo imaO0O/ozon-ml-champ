@@ -233,6 +233,79 @@ def gather(seq, rows: np.ndarray, cutoff: dt.date, lookback: int) -> np.ndarray:
     return out
 
 
+def events_window(win: np.ndarray, n_tokens: int) -> np.ndarray:
+    """Дневную сетку — в последовательность событий: (len(rows), n_tokens, C + 3).
+
+    Зачем. В окне 90 дней у медианного клиента активны 30, в окне 180 — 55;
+    63–65% дневной сетки это нули, и рекуррентность тратится на их пробегание.
+    Промежуток между покупками при этом закодирован **неявно** — длиной пробега
+    нулей, которую сеть обязана посчитать сама. Здесь он становится числом.
+
+    Почему это важнее, чем экономия шагов. Разложение роста площадки показывает,
+    что GMV на зарегистрированного клиента за 30 дней вырос с 58 до 111, а GMV
+    на активного клиента в день остался плоским: 8.46 против 8.53. Рост — это
+    **частота появлений, а не размер чека**, то есть дрейф между обучающими
+    срезами и тестом сидит ровно в длинах промежутков. На плотной сетке модель
+    видит его косвенно, здесь — прямо, отдельным каналом.
+
+    Побочно вход втрое короче: те же 180 дней истории укладываются в ~55 токенов,
+    а бюджет в 128 токенов покрывает больше года.
+
+    Три добавленных канала после C данных:
+
+    * `valid` — 1 у настоящего токена, 0 у добивки слева (у клиентов с малым
+      числом активных дней последовательность короче бюджета);
+    * `age` — log1p дней от события до cutoff'а, то есть рецентность в явном
+      виде, а не позицией в последовательности;
+    * `gap` — log1p дней с прошлого события; у самого старого токена это
+      расстояние до начала окна, то есть длина молчания перед ним.
+
+    Токены выровнены вправо: самое свежее событие всегда в последнем слоте.
+    Это тот же порядок, что у плотной сетки, поэтому голова с пулом последнего
+    состояния продолжает читать «что происходит прямо перед cutoff'ом».
+
+    При переполнении бюджета берутся **свежие** события: «свежесть важнее
+    количества» подтверждена в этой задаче трижды.
+
+    Оговорка. Канал `observed` из `gather` здесь не переносится: все токены по
+    построению наблюдаемые. Разницу «истории не было» против «клиент молчал»
+    несёт `gap` у старейшего токена — величина разная, но не помеченная. Для
+    старых срезов с короткой историей это слабее явного флага.
+    """
+    n, lookback, c_in = win.shape
+    n_raw = len(RAW_CHANNELS)
+    c = c_in - 1  # канал observed не переносится, см. оговорку выше
+    dat = win[:, :, :c]
+
+    active = (dat[:, :, :n_raw] != 0).any(axis=2)
+    # Ранг с конца: 1 у самого свежего активного дня. Бюджет режет старые.
+    rank = np.cumsum(active[:, ::-1], axis=1)[:, ::-1]
+    keep = active & (rank <= n_tokens)
+    slot = n_tokens - rank
+
+    out = np.zeros((n, n_tokens, c + 3), dtype=np.float32)
+    b, d = np.nonzero(keep)
+    s = slot[b, d]
+    out[b, s, :c] = dat[b, d]
+    out[b, s, c] = 1.0
+
+    # d = lookback - 1 — день накануне cutoff'а, его возраст 1 день.
+    age = np.zeros((n, n_tokens), dtype=np.float32)
+    age[b, s] = lookback - d
+    out[:, :, c + 1] = np.log1p(age)
+
+    valid = out[:, :, c] > 0
+    prev_age = np.zeros_like(age)
+    prev_age[:, 1:] = age[:, :-1]
+    prev_valid = np.zeros_like(valid)
+    prev_valid[:, 1:] = valid[:, :-1]
+    # У старейшего токена предыдущего события нет: берём расстояние до начала
+    # окна, lookback - age = число дней молчания перед ним.
+    gap = np.where(prev_valid, prev_age - age, lookback - age)
+    out[:, :, c + 2] = np.log1p(np.clip(gap, 0, None)) * valid
+    return out
+
+
 def history_mask(first_day: np.ndarray, cutoff: dt.date) -> np.ndarray:
     """Пользователи, у которых есть хотя бы одно событие до cutoff'а.
 
@@ -243,12 +316,54 @@ def history_mask(first_day: np.ndarray, cutoff: dt.date) -> np.ndarray:
     return first_day < day_index(cutoff)
 
 
+def report_events(n_tokens: int, lookback: int, sample: int = 40000,
+                  chunk: int = 4000) -> None:
+    """Сколько токенов на самом деле нужно: распределение активных дней в окне.
+
+    Бюджет выбирается не на глаз: слишком маленький режет историю у активных
+    клиентов, слишком большой возвращает добивку нулями, ради избавления от
+    которой всё и затевалось.
+
+    Окна берутся кусками: `gather` разворачивает плотный float32, и выборка
+    целиком — это гигабайты сверх самой матрицы.
+    """
+    from config import TEST_CUTOFF, train_cutoffs
+
+    seq, users, first_day, _ = build()
+    rng = np.random.default_rng(0)
+    n_raw = len(RAW_CHANNELS)
+
+    print(f"окно {lookback} дней, бюджет {n_tokens} токенов, выборка {sample:,}\n")
+    print(f"{'срез':<14}{'активных дней':>26}{'плотность':>11}{'переполнили':>13}")
+    for cutoff in train_cutoffs(6) + [TEST_CUTOFF]:
+        rows = np.nonzero(history_mask(first_day, cutoff))[0]
+        sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
+        act = np.concatenate([
+            (gather(seq, sel[i:i + chunk], cutoff, lookback)[:, :, :n_raw] != 0)
+            .any(axis=2).sum(axis=1)
+            for i in range(0, len(sel), chunk)])
+        q = np.percentile(act, [25, 50, 75])
+        print(f"{str(cutoff):<14}"
+              f"{f'{q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}':>26}"
+              f"{act.mean() / lookback:>10.1%}{(act > n_tokens).mean():>13.1%}")
+    print("\nактивных дней — квартили 25 / 50 / 75; плотность — доля непустых дней")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--events", type=int, default=0,
+                    help="не собирать матрицу, а показать, сколько токенов нужно "
+                         "событийному представлению при таком бюджете")
+    ap.add_argument("--lookback", type=int, default=180,
+                    help="длина окна для отчёта --events")
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--chunks", type=int, default=8,
                     help="на сколько диапазонов пользователей резать проход (меньше = больше RAM)")
     args = ap.parse_args()
+
+    if args.events:
+        report_events(args.events, args.lookback)
+        return
 
     seq, users, first_day, last_day = build(rebuild=args.rebuild, chunks=args.chunks)
     print(f"\nматрица: {seq.shape} {seq.dtype}")
