@@ -51,7 +51,12 @@ warnings.filterwarnings("ignore", message=".*Failed to find CUDA.*")
 from config import (HORIZON, MODELS, SAMPLE_SUBMIT, SEED, SUBMISSIONS, TEST_CUTOFF,
                     train_cutoffs)
 from datasets import get_dataset
-from features import build_target
+from features import build_target, scan_log
+
+# Границы подокон внутри горизонта для вспомогательного надзора. Последнее окно
+# длиннее: 30 дней на четыре ровные недели не делятся, а плодить пятую голову
+# ради двух дней смысла нет.
+AUX_EDGES = [7, 14, 21, HORIZON]
 from metrics import report, rmse_log
 from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, gather, history_mask,
                       open_seq, window_bounds)
@@ -136,6 +141,45 @@ def targets_for(cutoff: dt.date, users: np.ndarray, first_day: np.ndarray):
     pos = np.searchsorted(users, tgt["user_id"].to_numpy())
     y[pos] = tgt["target"].to_numpy()
     return rows, y[rows]
+
+
+def aux_targets(cutoff: dt.date, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """Суммы gmv по подокнам горизонта — вспомогательный надзор для сети.
+
+    Зачем. Все наши сети предсказывают одно число: сумму за 30 дней. Бустинг
+    при этом раскладывает задачу на две (вероятность покупки и условный log1p),
+    и это единственная постановочная развилка, которую у сети мы не пробовали —
+    перебирали только представление входа и ёмкость.
+
+    Подокна дают сети различать «когда» внутри горизонта, а не только «сколько».
+    Основная голова остаётся та же, дополнительные головы работают только на
+    обучении: на выходе берётся первая. Такой надзор меняет не объём информации,
+    а то, какую структуру сеть вынуждена выучить, — а именно на различии
+    структуры ошибок и зарабатывает ансамбль.
+
+    Утечки нет: подокна лежат внутри того же `[cutoff, cutoff + HORIZON)`,
+    который и так целиком известен на обучающих срезах.
+
+    Возвращает сырые суммы, как и `build_target`. В log1p их переводит вызывающий
+    код — там же, где и основную цель, чтобы шкалы не разъехались.
+    """
+    day = (pl.col("event_date") - pl.lit(cutoff)).dt.total_days()
+    bin_expr = pl.lit(len(AUX_EDGES) - 1)
+    for i, e in enumerate(AUX_EDGES[:-1][::-1]):
+        bin_expr = pl.when(day < e).then(len(AUX_EDGES) - 2 - i).otherwise(bin_expr)
+    end = cutoff + dt.timedelta(days=HORIZON)
+    df = (
+        scan_log()
+        .filter((pl.col("event_date") >= cutoff) & (pl.col("event_date") < end))
+        .with_columns(bin_expr.alias("_bin"))
+        .group_by(["user_id", "_bin"])
+        .agg(pl.col("gmv").sum().alias("g"))
+        .collect(engine="streaming")
+    )
+    out = np.zeros((len(users), len(AUX_EDGES)), dtype=np.float64)
+    pos = np.searchsorted(users, df["user_id"].to_numpy())
+    out[pos, df["_bin"].to_numpy()] = df["g"].to_numpy()
+    return out[rows]
 
 
 def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
@@ -245,7 +289,8 @@ def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
 
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
-            bin_days: int = 1, static: np.ndarray | None = None):
+            bin_days: int = 1, static: np.ndarray | None = None,
+            aux: np.ndarray | None = None):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
@@ -253,7 +298,8 @@ def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: i
         sel = rows[take]
         x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)
         s = None if static is None else static[take]
-        yield x, s, (None if y is None else y[take]), take
+        a = None if aux is None else aux[take]
+        yield x, s, (None if y is None else y[take]), a, take
 
 
 # --------------------------------------------------------------------------- модель
@@ -276,7 +322,7 @@ class SeqNet(nn.Module):
 
     def __init__(self, n_ch: int, hidden: int = 128, layers: int = 1, arch: str = "gru",
                  dropout: float = 0.1, lookback: int = 180, heads: int = 4,
-                 n_static: int = 0):
+                 n_static: int = 0, n_aux: int = 0):
         super().__init__()
         self.arch = arch
         self.n_static = n_static
@@ -301,9 +347,12 @@ class SeqNet(nn.Module):
                 nn.Dropout(dropout), nn.Linear(hidden, hidden), nn.GELU(),
             )
             head_in += hidden
+        # Выходов 1 + n_aux: первый — сумма за горизонт, остальные — подокна.
+        # Дополнительные головы работают только на обучении.
+        self.n_aux = n_aux
         self.head = nn.Sequential(
             nn.LayerNorm(head_in), nn.Linear(head_in, hidden), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(hidden, 1),
+            nn.Dropout(dropout), nn.Linear(hidden, 1 + n_aux),
         )
 
     def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
@@ -317,7 +366,7 @@ class SeqNet(nn.Module):
             if s is None:
                 raise ValueError("модель ждёт статические признаки, а их не подали")
             pooled = torch.cat([pooled, self.static(s)], dim=1)
-        return self.head(pooled).squeeze(-1)
+        return self.head(pooled)
 
 
 # --------------------------------------------------------------------------- обучение
@@ -329,13 +378,15 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
     out = np.empty(len(rows), dtype=np.float64)
     prog = bar(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
-        for x, s, _, take in batches(seq, rows, cutoff, lookback, batch_size,
-                                     bin_days=bin_days, static=static):
+        for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
+                                        bin_days=bin_days, static=static):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
                 p = model(xb, sb)
-            out[take] = p.float().cpu().numpy()
+            # Первый выход — основная голова. Остальные, если они есть, живут
+            # только на обучении и в предсказание не идут.
+            out[take] = p[:, 0].float().cpu().numpy()
             prog.update(1)
     prog.close()
     return out
@@ -349,7 +400,8 @@ def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
 
 def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, args,
                 mean, std, device, epochs: int | None = None,
-                train_base=None, val_base=None, train_static=None, val_static=None):
+                train_base=None, val_base=None, train_static=None, val_static=None,
+                train_aux=None):
     """Обучение с ранней остановкой по валидации; возвращает (модель, эпохи, история).
 
     Если `val_rows` пуст — это финальное дообучение: остановка по числу эпох,
@@ -359,12 +411,15 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     torch.manual_seed(args.seed)
     steps = args.lookback // args.bin
     n_static = 0 if train_static is None else train_static[0].shape[1]
+    n_aux = 0 if train_aux is None else train_aux[0].shape[1]
     model = SeqNet(len(CHANNELS) + 1, args.hidden, args.layers, args.arch,
-                   args.dropout, steps, args.heads, n_static).to(device)
+                   args.dropout, steps, args.heads, n_static, n_aux).to(device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней "
           f"= {steps} шагов по {args.bin} дн. | {len(CHANNELS) + 1} каналов"
-          f"{f' + {n_static} рангов' if n_static else ''} | устройство {device}")
+          f"{f' + {n_static} рангов' if n_static else ''}"
+          f"{f' | + {n_aux} вспомогательных голов, вес {args.aux_weight}' if n_aux else ''}"
+          f" | устройство {device}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # Шаги считаются посрезово: батчи не смешивают срезы, поэтому хвостовой
@@ -388,21 +443,31 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             # В режиме остатка целью становится то, чего бустингу не хватило.
             ylog = np.log1p(y) if train_base is None else np.log1p(y) - train_base[ci]
             st = None if train_static is None else train_static[ci]
-            for x, s, yb, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                       ylog, shuffle=True, rng=rng, bin_days=args.bin,
-                                       static=st):
+            ax = None if train_aux is None else train_aux[ci]
+            for x, s, yb, ab, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
+                                           ylog, shuffle=True, rng=rng, bin_days=args.bin,
+                                           static=st, aux=ax):
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
                 tb = torch.from_numpy(yb).float().to(device)
                 with autocast(device):
-                    loss = nn.functional.mse_loss(model(xb, sb), tb)
+                    p = model(xb, sb)
+                    loss = nn.functional.mse_loss(p[:, 0], tb)
+                    main = float(loss)
+                    if ab is not None:
+                        # Вспомогательные головы влияют только на градиент:
+                        # в отчётный RMSE идёт основная, иначе числа стали бы
+                        # несравнимы с прежними прогонами.
+                        aux_t = torch.from_numpy(ab).float().to(device)
+                        loss = loss + args.aux_weight * nn.functional.mse_loss(
+                            p[:, 1:], aux_t)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 if sched.last_epoch < sched.total_steps - 1:
                     sched.step()
-                run += float(loss) * len(yb)
+                run += main * len(yb)
                 seen += len(yb)
                 done += 1
                 prog.update(1)
@@ -452,7 +517,7 @@ def predict_empty(model, args, mean, std, device) -> float:
         sb = (None if not model.n_static else
               torch.zeros((1, model.n_static), dtype=torch.float32, device=device))
         with autocast(device):
-            return float(model(xb, sb).float().cpu().numpy()[0])
+            return float(model(xb, sb)[:, 0].float().cpu().numpy()[0])
 
 
 def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict,
@@ -552,6 +617,12 @@ def main() -> None:
     ap.add_argument("--final", action="store_true",
                     help="дообучить на train+val и собрать сабмит")
     ap.add_argument("--out", default=None, help="имя файла сабмита")
+    ap.add_argument("--multitask", action="store_true",
+                    help="дополнительно предсказывать суммы по подокнам горизонта. "
+                         "На выходе по-прежнему одна голова — подокна работают "
+                         "только на обучении и меняют структуру ошибок")
+    ap.add_argument("--aux-weight", type=float, default=0.3,
+                    help="вес вспомогательного лосса относительно основного")
     ap.add_argument("--static", default=None,
                     help="подать сети статические признаки по префиксу колонок "
                          "(например rk_ — процентильные ранги из блока ranks). "
@@ -648,10 +719,22 @@ def main() -> None:
     mean = torch.from_numpy(mean_np).to(device)
     std = torch.from_numpy(std_np).to(device)
 
+    train_aux = None
+    if args.multitask:
+        t0 = time.time()
+        # log1p, как и основная цель: сеть предсказывает в этой шкале, и лосс
+        # между рублями и логарифмами был бы просто несопоставимыми величинами.
+        train_aux = [np.log1p(aux_targets(c, users, r))
+                     for c, r in zip(train_cuts, train_rows)]
+        share = np.mean([(a > 0).mean() for a in train_aux])
+        print(f"вспомогательные головы: {len(AUX_EDGES)} подокон "
+              f"{AUX_EDGES}, доля ненулевых {share:.1%}, за {time.time() - t0:.0f}s")
+
     model, best_epoch, _ = train_model(seq, train_rows, train_y, train_cuts,
                                        val_rows, val_y, val_cut, args, mean, std, device,
                                        train_base=train_base, val_base=val_base,
-                                       train_static=train_static, val_static=val_static)
+                                       train_static=train_static, val_static=val_static,
+                                       train_aux=train_aux)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                      mean, std, device, bin_days=args.bin, static=val_static)
@@ -710,10 +793,12 @@ def main() -> None:
     all_y = [*train_y, val_y]
     all_base = None if train_base is None else [*train_base, val_base]
     all_static = None if train_static is None else [*train_static, val_static]
+    all_aux = (None if train_aux is None
+               else [*train_aux, np.log1p(aux_targets(val_cut, users, val_rows))])
     final, _, _ = train_model(seq, all_rows, all_y, all_cuts, np.array([], dtype=int),
                               np.array([]), val_cut, args, mean, std, device,
                               epochs=best_epoch, train_base=all_base,
-                              train_static=all_static)
+                              train_static=all_static, train_aux=all_aux)
 
     ckpt = MODELS / f"{args.name}_{args.arch}.pt"
     torch.save({"state_dict": final.state_dict(), "mean": mean_np, "std": std_np,
