@@ -196,12 +196,39 @@ def main() -> None:
                            "знак не совпал — по правилу раздела 2 PLAN.md не принимается"))
 
 
+def leveled(y: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Сдвинуть предсказание в оптимальный уровень перебором.
+
+    Аналитический оптимум смещён обрезкой нуля, поэтому перебор, а не формула.
+    """
+    grid = np.arange(-0.40, 0.26, 0.0025)
+    return p + grid[int(np.argmin([rmse_log(y, p + d) for d in grid]))]
+
+
 def fit_eval(Xtr, ytr, Xva, yva, feats, rounds, tag):
+    """Возвращает RMSLE ПОСЛЕ выравнивания уровня — сравнивать можно только его.
+
+    Уровень в сабмите правится бесплатно (`--derive-shift` выводит его из
+    измеренной константы окна), поэтому засчитывать модели его исправление
+    нельзя: она получит второй раз то, что мы и так имеем даром.
+
+    Ловушка срабатывала трижды. Ранги: 0.0033 на валидации против 0.00037 на
+    лидерборде. Сеть на остатке бустинга: +0.0111 сырых против 0.00000 после
+    выравнивания. Стекинг на сыром предсказании: +0.0094 против ~0.0001 —
+    там сырой признак просто позволял деревьям опознать срез, потому что
+    внутри среза он отличается от центрированного на константу и упорядочивает
+    клиентов тождественно.
+    """
     m = GBM("lgbm", "reg", "cpu", n_estimators=rounds, early_stopping=200, log_period=0)
     m.fit(Xtr, np.log1p(ytr), Xva, np.log1p(yva), feature_names=feats)
     p = m.predict(Xva)
-    report(yva, np.expm1(np.clip(p, 0, None)), tag)
-    return rmse_log(np.log1p(yva), p), m.best_iter
+    ylog = np.log1p(yva)
+    raw = rmse_log(ylog, p)
+    pl_ = leveled(ylog, p)
+    report(yva, np.expm1(np.clip(pl_, 0, None)), tag)
+    print(f"    сырой RMSLE {raw:.5f}, после выравнивания {rmse_log(ylog, pl_):.5f} "
+          f"(разница {raw - rmse_log(ylog, pl_):+.5f} — это уровень, он бесплатен)")
+    return rmse_log(ylog, pl_), m.best_iter
 
 
 if __name__ == "__main__":
