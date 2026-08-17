@@ -60,6 +60,22 @@ def load_hidden(name: str, cut: dt.date, users: np.ndarray) -> np.ndarray:
     return out
 
 
+def load_pred(name: str, cut: dt.date, users: np.ndarray) -> np.ndarray:
+    """Предсказание сети колонкой, выровненное по порядку `users`."""
+    path = MODELS / f"{name}_{cut}.npz"
+    if not path.exists():
+        raise SystemExit(f"нет {path.name} — это выгрузка предсказаний, "
+                         f"а не состояний (seq_oof_net.py без --hidden)")
+    d = np.load(path)
+    order = np.argsort(d["user_id"])
+    su, sp = d["user_id"][order], d["pred_log"][order]
+    pos = np.clip(np.searchsorted(su, users), 0, len(su) - 1)
+    ok = su[pos] == users
+    out = np.full((len(users), 1), np.nan, dtype=np.float32)
+    out[ok, 0] = sp[pos[ok]]
+    return out
+
+
 def standardize(z: np.ndarray) -> np.ndarray:
     """Z-оценка по каждой оси внутри одного среза.
 
@@ -97,6 +113,11 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=20000)
     ap.add_argument("--pca", type=int, default=0,
                     help="сжать состояние до k компонент (0 — подавать все оси)")
+    ap.add_argument("--pred-name", default=None,
+                    help="префикс .npz с предсказаниями сети (например netoof). "
+                         "Предсказание добавляется в ОБЕ руки сравнения, поэтому "
+                         "измеряется вклад скрытого состояния СВЕРХ него — а не "
+                         "вместо него, как было в первом заходе")
     ap.add_argument("--raw", action="store_true",
                     help="подавать оси как есть, без нормировки внутри среза "
                          "(для воспроизведения провала: масштаб осей между срезами "
@@ -131,6 +152,19 @@ def main() -> None:
             ztr, zva = ztr @ axes, zva @ axes
             print(f"  сжато до {args.pca} компонент")
         assert len(ztr) == len(Xtr) and len(zva) == len(Xva), "строки разошлись"
+
+        # Предсказание сети — обученная проекция состояния, и она заведомо
+        # полезнее любой компоненты максимальной дисперсии. Если её не подать
+        # обеим рукам, сравнение мерит «состояние ВМЕСТО предсказания», что не
+        # тот вопрос: стекинг на предсказании уже принят и работает.
+        if args.pred_name:
+            ptr = np.vstack([load_pred(args.pred_name, c,
+                                       get_dataset(c)["user_id"].to_numpy())
+                             for c in cuts[1:]])
+            pva = load_pred(args.pred_name, val_cut, val["user_id"].to_numpy())
+            Xtr, Xva = np.hstack([Xtr, ptr]), np.hstack([Xva, pva])
+            feats = feats + ["net_pred"]
+            print(f"  предсказание сети подано обеим рукам ({args.pred_name})")
 
         base, _ = fit_eval(Xtr, ytr, Xva, yva, feats, args.rounds, "без состояния")
         znames = [f"nz_{i}" for i in range(ztr.shape[1])]
