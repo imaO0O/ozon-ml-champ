@@ -60,6 +60,20 @@ def load_hidden(name: str, cut: dt.date, users: np.ndarray) -> np.ndarray:
     return out
 
 
+def standardize(z: np.ndarray) -> np.ndarray:
+    """Z-оценка по каждой оси внутри одного среза.
+
+    Уровень и масштаб оси — свойство конкретной сети, а не пользователя, и на
+    тест оно не переносится. После нормировки колонка означает «на сколько своих
+    сигм этот клиент отклонился от среднего по срезу» — величина, сравнимая
+    между срезами по построению.
+    """
+    m = np.nanmean(z, axis=0)
+    s = np.nanstd(z, axis=0)
+    s[s < 1e-6] = 1.0
+    return (z - m) / s
+
+
 def fit_pca(mats: list[np.ndarray], k: int) -> np.ndarray:
     """Оси главных компонент, общие для всех срезов.
 
@@ -83,6 +97,10 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=20000)
     ap.add_argument("--pca", type=int, default=0,
                     help="сжать состояние до k компонент (0 — подавать все оси)")
+    ap.add_argument("--raw", action="store_true",
+                    help="подавать оси как есть, без нормировки внутри среза "
+                         "(для воспроизведения провала: масштаб осей между срезами "
+                         "различается в полтора раза, и деревья на этом ломаются)")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
 
@@ -96,9 +114,18 @@ def main() -> None:
         Xva, yva = to_xy(val, feats)
 
         # Скрытые состояния подаются в том же порядке строк, что и признаки.
-        ztr = np.vstack([load_hidden(args.name, c, get_dataset(c)["user_id"].to_numpy())
-                         for c in cuts[1:]])
+        blocks = [load_hidden(args.name, c, get_dataset(c)["user_id"].to_numpy())
+                  for c in cuts[1:]]
         zva = load_hidden(args.name, val_cut, val["user_id"].to_numpy())
+        if not args.raw:
+            # Нормировка ВНУТРИ среза. Оси у разных срезов совпадают (медиана
+            # корреляции 0.83), но масштаб разъезжается в полтора раза: std по
+            # осям 0.585 на январе против 0.379 на декабре. Деревья строят
+            # пороги по значению, поэтому растянутая ось означает на разных
+            # срезах разное — та же болезнь, от которой лечат ранги и доли.
+            blocks = [standardize(b) for b in blocks]
+            zva = standardize(zva)
+        ztr = np.vstack(blocks)
         if args.pca:
             axes = fit_pca([ztr], args.pca)
             ztr, zva = ztr @ axes, zva @ axes
