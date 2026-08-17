@@ -18,9 +18,12 @@ ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
 
 
 def build_test_frame(features: list[str], rebuild: bool = False,
-                     blocks: list[str] | None = None) -> tuple[pl.Series, np.ndarray]:
+                     blocks: list[str] | None = None,
+                     net: bool = False) -> tuple[pl.Series, np.ndarray]:
+    """net берётся из меты обучения: тестовая выборка должна собираться тем же
+    набором признаков, что и обучающая, иначе колонок просто не окажется."""
     users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
-    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks)
+    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks, net=net)
     df = users.join(feats, on="user_id", how="left")
     missing = df[features[0]].null_count()
     if missing:
@@ -51,14 +54,24 @@ def main() -> None:
     ap.add_argument("--note", default="", help="комментарий для журнала сабмитов")
     args = ap.parse_args()
 
-    meta = json.loads((MODELS / f"{args.name}_meta.json").read_text(encoding="utf-8"))
+    # Мета создаётся только вместе с весами, то есть под --final. Без неё
+    # прежняя проверка была недостижима: чтение падало трейсбеком строкой выше.
+    meta_path = MODELS / f"{args.name}_meta.json"
+    if not meta_path.exists():
+        have = sorted(p.stem[:-5] for p in MODELS.glob("*_meta.json"))
+        raise SystemExit(
+            f"нет моделей с именем '{args.name}': обучите их командой "
+            f"train.py --final --name {args.name}"
+            + (f"\nготовые имена: {', '.join(have)}" if have else ""))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not meta.get("final"):
         raise SystemExit(f"модели '{args.name}' обучены без --final, для сабмита переобучите train.py --final")
     features, w = meta["features"], meta["blend_w"]
     # Тестовые признаки собираем тем же набором блоков, что и обучающие.
     blocks = meta.get("blocks") if meta.get("blocks") != "all" else None
 
-    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks)
+    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks,
+                                  net=bool(meta.get("net")))
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
     reg = GBM.load(MODELS / f"{args.name}_reg.pkl")

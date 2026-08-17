@@ -28,7 +28,8 @@ from utils import append_csv, git_commit
 
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
-               stride: int | None = None, history: int | None = None):
+               stride: int | None = None, history: int | None = None, net: bool = False,
+               net_feats: str = "rank_centered"):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -51,8 +52,11 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     if not train_cuts:
         raise SystemExit(f"нет обучающих срезов раньше {latest_ok}: увеличьте --cutoffs")
     cuts = [val_cut, *train_cuts]
-    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history)
-    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history) for c in train_cuts]
+    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history, net=net,
+                      net_feats=net_feats)
+    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history, net=net,
+                          net_feats=net_feats)
+              for c in train_cuts]
     feats = feature_names(val)
     # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
     # feats берётся из колонок val, поэтому в X эта колонка не попадёт.
@@ -122,6 +126,13 @@ def two_stage_predict(clf: GBM, reg: GBM, X) -> np.ndarray:
     return clf.predict(X) * reg.predict(X)
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lgbm", choices=["lgbm", "cat", "xgb"])
@@ -146,6 +157,13 @@ def main() -> None:
                     help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
     ap.add_argument("--members", default="lgb",
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
+    ap.add_argument("--net", action="store_true",
+                    help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
+    ap.add_argument("--save-val-pred", action="store_true",
+                    help="сохранить предсказания на валидации в models/<имя>_valpred_<срез>.npz "
+                         "(user_id, pred_log, target) — для обмена с другими треками")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -155,7 +173,7 @@ def main() -> None:
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
-                                         stride=args.stride)
+                                         stride=args.stride, net=parse_net(args.net, args.net_names))
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -199,6 +217,18 @@ def main() -> None:
     p_blend = best_w * p_two + (1 - best_w) * p_single
     res["blend"] = report(yva, np.expm1(p_blend), f"blend w={best_w:.2f}")
 
+    # Обмен предсказаниями между треками: чтобы посчитать метрику совместного
+    # состава, не нужно передавать ни веса, ни код — достаточно предсказаний
+    # на одном и том же срезе. Уровень выравнивается по истине, иначе состав
+    # сравнивать нельзя: разница уровней подмешалась бы в результат бленда.
+    if args.save_val_pred:
+        aligned = p_blend - p_blend.mean() + yva_log.mean()
+        path = MODELS / f"{name}_valpred_{cuts[0]}.npz"
+        np.savez_compressed(path, user_id=val["user_id"].to_numpy(),
+                            pred_log=aligned, target=yva)
+        print(f"\nпредсказания валидации -> {path.name} "
+              f"({len(aligned):,} строк, уровень выровнен по истине)")
+
     print("\ntop-20 признаков (gain, single):")
     for f, g in single.feature_importance(feats)[:20]:
         print(f"  {f:<28} {g:,.0f}")
@@ -207,7 +237,7 @@ def main() -> None:
         "name": name, "model": args.model, "device": args.device,
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
         "metrics": res, "seed": SEED, "features_version": features_version(blocks),
-        "blocks": blocks or "all",
+        "blocks": blocks or "all", "net": parse_net(args.net, args.net_names),
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
 

@@ -21,29 +21,46 @@ def features_version(blocks: list[str] | None = None) -> str:
 
     Без этого сокомандник, добавивший признак, молча обучится на старом кэше
     и решит, что его идея не работает. Пересборка стоит ~20 секунд на срез.
+
+    Переводы строк нормализуются: git на Windows подменяет LF на CRLF при
+    выгрузке, и без нормализации хеш менялся бы после каждого `git checkout`
+    или у сокомандника с другими настройками autocrlf — кэш пересобирался бы
+    впустую, а `feat_ver` в журналах выглядел бы разным при одинаковом коде.
     """
+    def norm(path: Path) -> bytes:
+        return path.read_bytes().replace(b"\r\n", b"\n")
+
     pkg = Path(__file__).with_name("features")
-    src = b"".join(p.read_bytes() for p in sorted(pkg.glob("*.py")))
-    src += Path(__file__).with_name("config.py").read_bytes()
+    src = b"".join(norm(p) for p in sorted(pkg.glob("*.py")))
+    src += norm(Path(__file__).with_name("config.py"))
     src += ("|".join(blocks) if blocks else "all").encode()
     return hashlib.md5(src).hexdigest()[:8]
 
 
-def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None):
-    # В имени — источник данных (синтетика/реальные), версия кода признаков
-    # и глубина обрезки истории: с обрезкой и без неё это разные выборки.
+def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None,
+                 net: bool = False, net_feats: str = "rank_centered"):
+    # В имени — источник данных (синтетика/реальные), версия кода признаков,
+    # глубина обрезки истории и наличие признаков сети: это разные выборки.
     tail = f"_h{history}" if history else ""
+    if net:
+        # Имена сетей входят в ключ: выборка с одной сетью и с тремя — разные.
+        tail += "_net" if net is True else "_net-" + "-".join(net)
+        # Набор признаков сети тоже: с уровнем и без — разные выборки.
+        if net_feats != "rank_centered":
+            tail += f"-{net_feats}"
     return (DATA_PROC /
             f"ds_{TRAIN_PARQUET.stem}_{cutoff.isoformat()}_{features_version(blocks)}{tail}.parquet")
 
 
 def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
-                blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
-    path = dataset_path(cutoff, blocks, history)
+                blocks: list[str] | None = None, history: int | None = None,
+                net: bool = False, net_feats: str = "rank_centered") -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks, history, net, net_feats)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
-    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history)
+    df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history,
+                       net=net, net_feats=net_feats)
     df.write_parquet(path)
     print(f"[{cutoff}] {df.height:,} строк x {df.width} колонок за {time.time() - t0:.1f}s -> {path.name}")
     return df
@@ -54,10 +71,15 @@ def feature_names(df: pl.DataFrame) -> list[str]:
 
 
 def clean_stale_cache(keep: str) -> None:
-    """Удалить выборки прошлых версий признаков — каждая версия весит ~360 МБ."""
+    """Удалить выборки прошлых версий признаков — каждая версия весит ~640 МБ.
+
+    Версия ищется в любом месте имени, а не только в конце: у выборок,
+    собранных с --history, после хеша стоит суффикс вида `_h229`, и проверка
+    по окончанию имени сносила их всегда, сколько бы раз их ни пересобирали.
+    """
     freed = 0
     for p in DATA_PROC.glob("ds_*.parquet"):
-        if p.stem.endswith(keep):
+        if keep in p.stem:
             continue
         freed += p.stat().st_size
         p.unlink()
@@ -69,6 +91,13 @@ def parse_blocks(value: str | None) -> list[str] | None:
     return [b.strip() for b in value.split(",") if b.strip()] if value else None
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cutoffs", type=int, default=None, help="сколько обучающих cutoff'ов собрать")
@@ -78,6 +107,10 @@ def main() -> None:
                     help=f"подмножество блоков через запятую (есть: {','.join(sorted(BLOCKS))})")
     ap.add_argument("--clean", action="store_true", help="удалить кэш прошлых версий признаков")
     ap.add_argument("--stride", type=int, default=None, help="шаг между срезами в днях")
+    ap.add_argument("--net", action="store_true",
+                    help="признак предсказания сети (features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах (одинаковая глубина)")
     args = ap.parse_args()
@@ -88,10 +121,11 @@ def main() -> None:
     n = args.cutoffs if args.cutoffs is not None else None
     cuts = train_cutoffs(stride=args.stride) if n is None else train_cutoffs(n, args.stride)
     for c in cuts:
-        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks, history=args.history)
+        get_dataset(c, with_target=True, rebuild=args.rebuild, blocks=blocks,
+                    history=args.history, net=parse_net(args.net, args.net_names))
     if args.test:
         get_dataset(TEST_CUTOFF, with_target=False, rebuild=args.rebuild, blocks=blocks,
-                    history=args.history)
+                    history=args.history, net=parse_net(args.net, args.net_names))
 
 
 if __name__ == "__main__":
