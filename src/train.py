@@ -158,6 +158,9 @@ def main() -> None:
                     help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
     ap.add_argument("--net-names", default=None,
                     help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
+    ap.add_argument("--save-val-pred", action="store_true",
+                    help="сохранить предсказания на валидации в models/<имя>_valpred_<срез>.npz "
+                         "(user_id, pred_log, target) — для обмена с другими треками")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -210,6 +213,18 @@ def main() -> None:
             best_w, best_rmse = float(w), r
     p_blend = best_w * p_two + (1 - best_w) * p_single
     res["blend"] = report(yva, np.expm1(p_blend), f"blend w={best_w:.2f}")
+
+    # Обмен предсказаниями между треками: чтобы посчитать метрику совместного
+    # состава, не нужно передавать ни веса, ни код — достаточно предсказаний
+    # на одном и том же срезе. Уровень выравнивается по истине, иначе состав
+    # сравнивать нельзя: разница уровней подмешалась бы в результат бленда.
+    if args.save_val_pred:
+        aligned = p_blend - p_blend.mean() + yva_log.mean()
+        path = MODELS / f"{name}_valpred_{cuts[0]}.npz"
+        np.savez_compressed(path, user_id=val["user_id"].to_numpy(),
+                            pred_log=aligned, target=yva)
+        print(f"\nпредсказания валидации -> {path.name} "
+              f"({len(aligned):,} строк, уровень выровнен по истине)")
 
     print("\ntop-20 признаков (gain, single):")
     for f, g in single.feature_importance(feats)[:20]:
