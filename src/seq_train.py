@@ -182,6 +182,36 @@ def aux_targets(cutoff: dt.date, users: np.ndarray, rows: np.ndarray) -> np.ndar
     return out[rows]
 
 
+def rate_base(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
+              chunk: int = 4000) -> np.ndarray:
+    """Наивная экстраполяция темпа: log1p(средний дневной gmv в окне * HORIZON).
+
+    Пара к `--self-norm`, без которой та нормировка неполна. Деля каналы на
+    собственное среднее клиента, мы забираем у сети масштаб; если при этом цель
+    остаётся абсолютной, сеть обязана масштаб восстановить — из 27 рангов, то
+    есть решить лишнюю и чужую для неё задачу. Именно так был поставлен первый
+    замер, и он провалился (см. `self_norm` в seq_data.py).
+
+    Здесь масштаб не восстанавливается, а возвращается умножением: цель тоже
+    делится на собственный уровень клиента. Сеть учит чистое отношение «сколько
+    он купит за 30 дней относительно своего обычного темпа», а уровень
+    приходит обратно готовым числом.
+
+    Считается тем же механизмом, что `--residual`: база вычитается из цели на
+    обучении и прибавляется к предсказанию везде, включая сабмит.
+
+    Клиент без покупок в окне даёт базу log1p(0) = 0, и цель остаётся исходной —
+    отдельной ветки не нужно.
+
+    Утечки нет: окно обрывается на дне перед cutoff'ом.
+    """
+    out = np.empty(len(rows), dtype=np.float64)
+    for i in range(0, len(rows), chunk):
+        win = gather(seq, rows[i:i + chunk], cutoff, lookback)
+        out[i:i + chunk] = np.log1p(np.expm1(win[:, :, 0]).mean(axis=1) * HORIZON)
+    return out
+
+
 def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
     """Предсказание бустинга из seq_oof, выровненное по строкам матрицы.
 
@@ -629,6 +659,11 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
         p_log[~known] = predict_empty(model, args, mean, std, device)
+    if args.norm_target:
+        base = rate_base(seq, rows, TEST_CUTOFF, args.lookback)
+        print(f"  наивный темп добавляется обратно: mean base {base.mean():.4f}, "
+              f"mean остатка {p_log.mean():+.4f}")
+        p_log = p_log + base
     if args.residual:
         # Тот же объект, что и в обучении: бустинг, обученный на всех срезах.
         base = load_base(args.residual, "test", users, rows)
@@ -674,6 +709,9 @@ def main() -> None:
                     help="событийное представление: сколько последних активных дней "
                          "подавать токенами вместо дневной сетки (0 — сетка). "
                          "Промежутки в днях идут отдельными каналами age и gap")
+    ap.add_argument("--norm-target", action="store_true",
+                    help="делить и цель на собственный уровень клиента: сеть учит "
+                         "отношение к наивной экстраполяции темпа. Пара к --self-norm")
     ap.add_argument("--self-norm", action="store_true",
                     help="делить каналы клиента на его же среднее по окну: сеть "
                          "видит форму и тайминг, масштаб приходит рангами")
@@ -806,6 +844,18 @@ def main() -> None:
               f"({', '.join(cols[:4])}, ...)")
 
     train_base = val_base = None
+    if args.norm_target:
+        if args.residual:
+            raise SystemExit("--norm-target и --residual оба задают базу остатка, "
+                             "вместе они бессмысленны")
+        print("цель делится на собственный уровень: "
+              "цель = log1p(y) - log1p(средний дневной gmv в окне * 30)")
+        train_base = [rate_base(seq, r, c, args.lookback)
+                      for c, r in zip(train_cuts, train_rows)]
+        val_base = rate_base(seq, val_rows, val_cut, args.lookback)
+        print(f"  наивный темп сам по себе: RMSLE {rmse_log(np.log1p(val_y), val_base):.5f}")
+        print(f"  остаток: среднее {(np.log1p(val_y) - val_base).mean():+.4f} | "
+              f"std {(np.log1p(val_y) - val_base).std():.4f}")
     if args.residual:
         print(f"режим остатка: цель = log1p(y) - предсказание бустинга ({args.residual})")
         train_base = [load_base(args.residual, c.isoformat(), users, r)
@@ -867,7 +917,8 @@ def main() -> None:
         "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
         "feat_ver": (f"seq{len(CHANNELS)}x{args.lookback}"
                      + (f"e{args.events}" if args.events else f"b{args.bin}")
-                     + ("n" if args.self_norm else "")),
+                     + ("n" if args.self_norm else "")
+                     + ("t" if args.norm_target else "")),
         "blocks": "seq",
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
         "n_features": n_input_channels(args.events),
@@ -893,6 +944,7 @@ def main() -> None:
                                     else f"bin={args.bin} ")
                                  + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
                  + (" +self-norm" if args.self_norm else "")
+                 + (" +norm-target" if args.norm_target else "")
                  + (f" +static:{args.static}" if args.static else "")
                  + (f" +residual:{args.residual}" if args.residual else "")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
