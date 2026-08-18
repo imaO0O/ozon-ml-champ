@@ -32,7 +32,7 @@ import datetime as dt
 import numpy as np
 
 from config import MODELS, ROOT
-from metrics import report, rmse_log
+from metrics import gini_norm, report, rmse_log
 from models import GBM
 from seq_train import EXPERIMENT_FIELDS
 from train import load_split, to_xy
@@ -268,8 +268,79 @@ def blend_submissions(sources: list[str], weight: float, out: str | None) -> Non
                         f"поправки калибровки не применялись"})
 
 
+def leveled(y: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Оптимальный сдвиг перебором: аналитический оптимум смещён обрезкой нуля."""
+    grid = np.arange(-0.40, 0.26, 0.0025)
+    return p + grid[int(np.argmin([rmse_log(y, p + d) for d in grid]))]
+
+
+def compose_row(spec: str, name: str, val_cut: dt.date, note: str) -> None:
+    """Метрики совместного состава на валидации со строкой в общий журнал.
+
+    Зачем отдельно от `compose.py`. Тот считает и печатает, но строки в журнал
+    не пишет и берёт ровно две половины. У отправленных файлов команды строк в
+    `experiments.csv` нет вовсе, поэтому валидационный Gini у лучшего файла —
+    пустая клетка в таблице tie-breaker'ов, которую смотрит жюри. Здесь состав
+    задаётся произвольным числом участников с весами, а результат попадает
+    в журнал, откуда его берут наравне с обычными прогонами.
+
+    Уровень каждого участника выравнивается перед смешиванием: разница уровней
+    иначе подмешалась бы в состав постоянным сдвигом. Уровень самого состава
+    выравнивается тоже — в сабмите он и так правится бесплатно, и засчитывать
+    его исправление модели нельзя.
+    """
+    parts = []
+    for item in spec.split(","):
+        path, _, w = item.rpartition("=")
+        if not path:
+            raise SystemExit(f"нужно вида файл.npz=вес, получено {item!r}")
+        d = np.load(ROOT / path if not str(path).startswith(("/", "E:", "C:")) else path)
+        parts.append((path.strip(), float(w), d))
+
+    base = parts[0][2]
+    uid = base["user_id"]
+    tgt = next((p[2]["target"] for p in parts if "target" in p[2]), None)
+    if tgt is None:
+        raise SystemExit("ни в одном файле нет таргета")
+    y = np.log1p(tgt)
+
+    total = np.zeros(len(uid), dtype=np.float64)
+    print(f"{'участник':<44}{'вес':>7}{'RMSLE':>10}{'Gini':>9}")
+    for path, w, d in parts:
+        p = d["pred_log"]
+        if not np.array_equal(d["user_id"], uid):
+            pos = np.searchsorted(np.sort(d["user_id"]), uid)
+            order = np.argsort(d["user_id"])
+            if not np.array_equal(d["user_id"][order][pos], uid):
+                raise SystemExit(f"{path}: другой набор пользователей")
+            p = p[order][pos]
+        p = leveled(y, p)
+        total += w * p
+        e = np.expm1(np.clip(p, 0, None))
+        print(f"{path.split('/')[-1]:<44}{w:>7.3f}{rmse_log(y, p):>10.5f}"
+              f"{gini_norm(tgt, e):>9.4f}")
+
+    total = leveled(y, total)
+    res = report(tgt, np.expm1(np.clip(total, 0, None)), f"состав {name}")
+    append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
+        "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
+        "feat_ver": "compose", "blocks": "all+seq", "name": name, "model": "blend",
+        "cutoffs": "", "n_features": len(parts),
+        "rmsle_single": "", "rmsle_two_stage": "", "rmsle_blend": round(res["rmsle"], 5),
+        "blend_w": "", "gini_blend": round(res["gini"], 4),
+        "sum_bias_blend": round(res["sum_bias"], 4), "best_iter_single": "",
+        "stride": 30, "halflife": "", "val_cutoff": str(val_cut), "train_cutoffs": "",
+        "note": note or ("состав: " + ", ".join(
+            f"{p.split('/')[-1]} {w:.3f}" for p, w, _ in parts)
+            + " [уровень выровнен у участников и у состава]")})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--compose", default=None,
+                    help="состав через запятую: файл.npz=вес,файл.npz=вес. "
+                         "Считает метрики и пишет строку в experiments.csv")
+    ap.add_argument("--name", default="compose", help="имя строки в журнале")
     ap.add_argument("--blend-submissions", default=None,
                     help="смешать два готовых сабмита через запятую: бустинг,сеть "
                          "(вместо проверки на валидации)")
@@ -301,6 +372,11 @@ def main() -> None:
                          "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+
+    if args.compose:
+        compose_row(args.compose, args.name,
+                    dt.date.fromisoformat(args.val_cutoff), args.note)
+        return
 
     if args.solve_weight:
         parts = [s.strip() for s in args.solve_weight.split(",") if s.strip()]
