@@ -58,8 +58,9 @@ from features import build_target, scan_log
 # ради двух дней смысла нет.
 AUX_EDGES = [7, 14, 21, HORIZON]
 from metrics import report, rmse_log
-from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, events_window, gather,
-                      history_mask, open_seq, self_norm, window_bounds)
+from seq_data import (CHANNELS, MEAN_CHANNELS, RANK_CHANNELS, SUM_CHANNELS,
+                      events_window, gather, history_mask, open_seq, self_norm,
+                      window_bounds)
 from utils import append_csv, git_commit
 
 # Колонки и их порядок — ровно как в самом models/experiments.csv, а не как в
@@ -299,7 +300,7 @@ def load_static(cutoff: dt.date, users: np.ndarray, rows: np.ndarray,
 
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
                   sample: int = 20000, seed: int = SEED, bin_days: int = 1,
-                  events: int = 0, norm: bool = False):
+                  events: int = 0, norm: bool = False, no_ranks: bool = False):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
 
     Считать по всем данным нельзя: в выборку попал бы валидационный срез.
@@ -311,8 +312,9 @@ def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
     """
     rng = np.random.default_rng(seed)
     sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
+    n_data = len(CHANNELS) - (len(RANK_CHANNELS) if no_ranks else 0)
     x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events,
-                    norm)[:, :, :len(CHANNELS)]
+                    norm, no_ranks)[:, :, :n_data]
     mean = x.mean(axis=(0, 1))
     std = x.std(axis=(0, 1))
     std[std < 1e-6] = 1.0
@@ -349,8 +351,19 @@ def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
     return out
 
 
+def drop_day_ranks(x: np.ndarray) -> np.ndarray:
+    """Отрезать дневные ранги — контрольная рука A/B на той же матрице.
+
+    Иначе сравнивать пришлось бы с числами, снятыми на матрице прошлого
+    поколения, то есть в другом прогоне и на другом железе. С этим ключом обе
+    руки идут с одного файла, и разница остаётся ровно в каналах.
+    """
+    keep = len(CHANNELS) - len(RANK_CHANNELS)
+    return np.concatenate([x[:, :, :keep], x[:, :, len(CHANNELS):]], axis=2)
+
+
 def prep_window(x: np.ndarray, bin_days: int, events: int,
-                norm: bool = False) -> np.ndarray:
+                norm: bool = False, no_ranks: bool = False) -> np.ndarray:
     """Представление окна: дневная сетка, укрупнённые шаги или события.
 
     Взаимоисключающие ветки — оба преобразования читают ось дней, и применять
@@ -361,26 +374,31 @@ def prep_window(x: np.ndarray, bin_days: int, events: int,
     """
     if norm:
         x = self_norm(x)
+    if no_ranks:
+        x = drop_day_ranks(x)
     if events:
         return events_window(x, events)
     return bin_window(x, bin_days)
 
 
-def n_input_channels(events: int) -> int:
+def n_input_channels(events: int, no_ranks: bool = False) -> int:
     """Сколько каналов увидит сеть: у событий их на два больше (`age`, `gap`)."""
-    return len(CHANNELS) + (3 if events else 1)
+    n = len(CHANNELS) - (len(RANK_CHANNELS) if no_ranks else 0)
+    return n + (3 if events else 1)
 
 
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
             bin_days: int = 1, static: np.ndarray | None = None,
-            aux: np.ndarray | None = None, events: int = 0, norm: bool = False):
+            aux: np.ndarray | None = None, events: int = 0, norm: bool = False,
+            no_ranks: bool = False):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
-        x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events, norm)
+        x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events, norm,
+                        no_ranks)
         s = None if static is None else static[take]
         a = None if aux is None else aux[take]
         yield x, s, (None if y is None else y[take]), a, take
@@ -481,7 +499,7 @@ class SeqNet(nn.Module):
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
              desc: str = "предсказание", bin_days: int = 1, static=None, events: int = 0,
-             norm: bool = False):
+             norm: bool = False, no_ranks: bool = False):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
@@ -489,7 +507,7 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
                                         bin_days=bin_days, static=static, events=events,
-                                        norm=norm):
+                                        norm=norm, no_ranks=no_ranks):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
@@ -504,7 +522,7 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
 
 def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
                    bin_days: int = 1, static=None, events: int = 0,
-                   norm: bool = False) -> np.ndarray:
+                   norm: bool = False, no_ranks: bool = False) -> np.ndarray:
     """Скрытые состояния для всех строк — матрица (len(rows), hidden).
 
     Хранится во float16: точность здесь не критична (бустинг всё равно режет
@@ -548,7 +566,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     """
     torch.manual_seed(args.seed)
     steps = args.events or args.lookback // args.bin
-    n_ch = n_input_channels(args.events)
+    n_ch = n_input_channels(args.events, args.no_day_ranks)
     n_static = 0 if train_static is None else train_static[0].shape[1]
     n_aux = 0 if train_aux is None else train_aux[0].shape[1]
     model = SeqNet(n_ch, args.hidden, args.layers, args.arch,
@@ -587,6 +605,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             ax = None if train_aux is None else train_aux[ci]
             for x, s, yb, ab, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
                                            ylog, shuffle=True, rng=rng, bin_days=args.bin, events=args.events, norm=args.self_norm,
+                                    no_ranks=args.no_day_ranks,
                                            static=st, aux=ax):
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
@@ -654,9 +673,10 @@ def predict_empty(model, args, mean, std, device) -> float:
     представление и обязано отдавать в этом случае, — добивать его нечем.
     """
     steps = args.events or args.lookback // args.bin
-    x = np.zeros((1, steps, n_input_channels(args.events)), dtype=np.float32)
+    n_ch = n_input_channels(args.events, args.no_day_ranks)
+    x = np.zeros((1, steps, n_ch), dtype=np.float32)
     if not args.events:
-        x[:, :, len(CHANNELS)] = 1.0
+        x[:, :, n_ch - 1] = 1.0
     model.eval()
     with torch.no_grad():
         xb = to_device(x, mean, std, device)
@@ -735,6 +755,9 @@ def main() -> None:
                     help="событийное представление: сколько последних активных дней "
                          "подавать токенами вместо дневной сетки (0 — сетка). "
                          "Промежутки в днях идут отдельными каналами age и gap")
+    ap.add_argument("--no-day-ranks", action="store_true",
+                    help="отрезать три дневных ранга — контрольная рука A/B "
+                         "на той же матрице")
     ap.add_argument("--norm-target", action="store_true",
                     help="делить и цель на собственный уровень клиента: сеть учит "
                          "отношение к наивной экстраполяции темпа. Пара к --self-norm")
@@ -944,10 +967,11 @@ def main() -> None:
         "feat_ver": (f"seq{len(CHANNELS)}x{args.lookback}"
                      + (f"e{args.events}" if args.events else f"b{args.bin}")
                      + ("n" if args.self_norm else "")
-                     + ("t" if args.norm_target else "")),
+                     + ("t" if args.norm_target else "")
+                     + ("-rk" if args.no_day_ranks else "")),
         "blocks": "seq",
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
-        "n_features": n_input_channels(args.events),
+        "n_features": n_input_channels(args.events, args.no_day_ranks),
         "rmsle_single": round(res["rmsle"], 5), "rmsle_two_stage": "",
         # rmsle_blend дублирует rmsle_single: у сети одна голова, а команда
         # сравнивает строки журнала именно по этой колонке.
@@ -971,6 +995,7 @@ def main() -> None:
                                  + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
                  + (" +self-norm" if args.self_norm else "")
                  + (" +norm-target" if args.norm_target else "")
+                 + (" -day-ranks" if args.no_day_ranks else "")
                  + (f" +static:{args.static}" if args.static else "")
                  + (f" +residual:{args.residual}" if args.residual else "")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
