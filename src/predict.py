@@ -31,6 +31,14 @@ def build_test_frame(features: list[str], rebuild: bool = False,
     fills = [pl.col(c).fill_null(0.0) for c in features if any(h in c for h in ZERO_FILL_HINTS)]
     if fills:
         df = df.with_columns(fills)
+    missing_cols = [c for c in features if c not in df.columns]
+    if missing_cols:
+        raise SystemExit(
+            f"в тестовой выборке нет {len(missing_cols)} признаков обучения: "
+            f"{', '.join(missing_cols[:6])}"
+            + (" ..." if len(missing_cols) > 6 else "")
+            + " | тест собран другим набором признаков, чем обучение: "
+              "чаще всего разошёлся net в мете (стекинг на именованных сетях)")
     X = df.select(features).to_numpy().astype(np.float32)
     return df["user_id"], X
 
@@ -70,8 +78,13 @@ def main() -> None:
     # Тестовые признаки собираем тем же набором блоков, что и обучающие.
     blocks = meta.get("blocks") if meta.get("blocks") != "all" else None
 
+    # net из меты передаётся КАК ЕСТЬ, а не через bool(): при стекинге на
+    # нескольких сетях там лежит список имён (["dr", "sh"]), и приведение к
+    # логическому значению превращало его в «одна безымянная сеть». Тест
+    # собирался тогда с колонками net_rank/net_centered, которых модель не
+    # видела, и падал на выборке признаков.
     user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks,
-                                  net=bool(meta.get("net")))
+                                  net=meta.get("net", False))
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
     reg = GBM.load(MODELS / f"{args.name}_reg.pkl")
