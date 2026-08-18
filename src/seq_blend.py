@@ -335,8 +335,98 @@ def compose_row(spec: str, name: str, val_cut: dt.date, note: str) -> None:
             + " [уровень выровнен у участников и у состава]")})
 
 
+def sweep_weights(spec: str, at: str | None, tol: float = 0.0001) -> None:
+    """Насколько плоская кривая веса — точным решением, а не перебором.
+
+    Зачем. Веса состава подобраны на одном срезе валидации, и трек A ставит
+    правильный вопрос: не подогнаны ли они под шум. У бленда голов веса скакали
+    от 0.2 до 0.9 между прогонами — верный признак плоской кривой, на которой
+    оптимум ничего не значит. Перебор на это не отвечает: он показывает, где
+    минимум, но не показывает, сколько стоит от него отойти.
+
+    Перебирать и не надо. После выравнивания уровня остаток каждого участника
+    имеет нулевое среднее, и при сумме весов 1 остаток состава — это просто
+    взвешенная сумма остатков. Значит MSE(w) = w'Cw, где C — ковариация
+    остатков: **точная квадратичная форма**, а не приближение. Отсюда сразу
+
+        оптимум      w* = C^-1 1 / (1' C^-1 1)
+        цена отхода  (w - w*)' C (w - w*)
+
+    Второе и есть ответ на вопрос о подгонке. Если отход к равным весам стоит
+    меньше шума лидерборда, веса не значимы, и на private безопаснее равные:
+    там выборка вчетверо больше, а подгонка под январский шум не переносится.
+
+    Радиус — насколько далеко веса можно сдвинуть в худшую сторону, оставаясь
+    дешевле `tol` по RMSLE. Считается по наибольшему собственному числу C на
+    подпространстве сумма-ноль, то есть это гарантия для любого направления.
+    """
+    paths = [p.strip() for p in spec.split(",") if p.strip()]
+    if len(paths) < 2:
+        raise SystemExit("нужно хотя бы два участника")
+
+    base = np.load(ROOT / paths[0])
+    uid = base["user_id"]
+    tgt = base["target"]
+    y = np.log1p(tgt)
+
+    resid = np.empty((len(uid), len(paths)), dtype=np.float64)
+    print(f"{'участник':<44}{'RMSLE':>10}{'Gini':>9}")
+    for j, path in enumerate(paths):
+        d = np.load(ROOT / path)
+        p = d["pred_log"]
+        if not np.array_equal(d["user_id"], uid):
+            order = np.argsort(d["user_id"])
+            pos = np.searchsorted(d["user_id"][order], uid)
+            if not np.array_equal(d["user_id"][order][pos], uid):
+                raise SystemExit(f"{path}: другой набор пользователей")
+            p = p[order][pos]
+        p = leveled(y, p)
+        resid[:, j] = p - y
+        print(f"{path.split('/')[-1]:<44}{rmse_log(y, p):>10.5f}"
+              f"{gini_norm(tgt, np.expm1(np.clip(p, 0, None))):>9.4f}")
+
+    k = len(paths)
+    cov = resid.T @ resid / len(uid)
+    inv1 = np.linalg.solve(cov, np.ones(k))
+    w_opt = inv1 / inv1.sum()
+
+    def mse(w: np.ndarray) -> float:
+        return float(w @ cov @ w)
+
+    points = [("оптимум на этом срезе", w_opt),
+              ("равные веса", np.full(k, 1.0 / k))]
+    if at:
+        w_at = np.array([float(v) for v in at.split(",")], dtype=np.float64)
+        if len(w_at) != k:
+            raise SystemExit(f"--at: нужно {k} весов, дано {len(w_at)}")
+        if abs(w_at.sum() - 1.0) > 1e-6:
+            raise SystemExit(f"--at: веса должны давать в сумме 1, дано {w_at.sum():.4f}")
+        points.insert(1, ("веса состава", w_at))
+
+    best = mse(w_opt)
+    print(f"\n{'точка':<24}{'веса':<34}{'RMSLE':>10}{'цена':>10}")
+    for label, w in points:
+        cur = mse(w)
+        # Цена в шкале RMSLE, а не MSE: сравнивать её будут с ответами лидерборда.
+        print(f"{label:<24}{' '.join(f'{v:.3f}' for v in w):<34}"
+              f"{cur ** 0.5:>10.5f}{cur ** 0.5 - best ** 0.5:>+10.5f}")
+
+    # Худшее направление сдвига весов: сумма-ноль, наибольшее собственное число.
+    basis = np.eye(k)[:, 1:] - np.eye(k)[:, :1]
+    basis /= np.linalg.norm(basis, axis=0)
+    lam = float(np.linalg.eigvalsh(basis.T @ cov @ basis).max())
+    radius = (2 * tol * best ** 0.5 / lam) ** 0.5
+    print(f"\nрадиус: веса можно сдвинуть на {radius:.3f} в любую сторону "
+          f"ценой не больше {tol} RMSLE")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--sweep", default=None,
+                    help="файлы состава через запятую без весов: считает оптимум, "
+                         "цену равных весов и радиус плоскости")
+    ap.add_argument("--at", default=None,
+                    help="веса, которыми состав собран на самом деле (для --sweep)")
     ap.add_argument("--compose", default=None,
                     help="состав через запятую: файл.npz=вес,файл.npz=вес. "
                          "Считает метрики и пишет строку в experiments.csv")
@@ -372,6 +462,10 @@ def main() -> None:
                          "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+
+    if args.sweep:
+        sweep_weights(args.sweep, args.at)
+        return
 
     if args.compose:
         compose_row(args.compose, args.name,
