@@ -59,7 +59,7 @@ from features import build_target, scan_log
 AUX_EDGES = [7, 14, 21, HORIZON]
 from metrics import report, rmse_log
 from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, events_window, gather,
-                      history_mask, open_seq, window_bounds)
+                      history_mask, open_seq, self_norm, window_bounds)
 from utils import append_csv, git_commit
 
 # Колонки и их порядок — ровно как в самом models/experiments.csv, а не как в
@@ -243,7 +243,7 @@ def load_static(cutoff: dt.date, users: np.ndarray, rows: np.ndarray,
 
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
                   sample: int = 20000, seed: int = SEED, bin_days: int = 1,
-                  events: int = 0):
+                  events: int = 0, norm: bool = False):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
 
     Считать по всем данным нельзя: в выборку попал бы валидационный срез.
@@ -255,7 +255,8 @@ def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
     """
     rng = np.random.default_rng(seed)
     sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
-    x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events)[:, :, :len(CHANNELS)]
+    x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events,
+                    norm)[:, :, :len(CHANNELS)]
     mean = x.mean(axis=(0, 1))
     std = x.std(axis=(0, 1))
     std[std < 1e-6] = 1.0
@@ -292,12 +293,18 @@ def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
     return out
 
 
-def prep_window(x: np.ndarray, bin_days: int, events: int) -> np.ndarray:
+def prep_window(x: np.ndarray, bin_days: int, events: int,
+                norm: bool = False) -> np.ndarray:
     """Представление окна: дневная сетка, укрупнённые шаги или события.
 
     Взаимоисключающие ветки — оба преобразования читают ось дней, и применять
     их подряд бессмысленно: после укрупнения «активный день» уже не день.
+
+    Нормировка на собственную историю применяется до них: она работает по дням,
+    и её среднее должно считаться по исходной сетке, а не по укрупнённой.
     """
+    if norm:
+        x = self_norm(x)
     if events:
         return events_window(x, events)
     return bin_window(x, bin_days)
@@ -311,13 +318,13 @@ def n_input_channels(events: int) -> int:
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
             bin_days: int = 1, static: np.ndarray | None = None,
-            aux: np.ndarray | None = None, events: int = 0):
+            aux: np.ndarray | None = None, events: int = 0, norm: bool = False):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
-        x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events)
+        x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events, norm)
         s = None if static is None else static[take]
         a = None if aux is None else aux[take]
         yield x, s, (None if y is None else y[take]), a, take
@@ -417,14 +424,16 @@ class SeqNet(nn.Module):
 # --------------------------------------------------------------------------- обучение
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
-             desc: str = "предсказание", bin_days: int = 1, static=None, events: int = 0):
+             desc: str = "предсказание", bin_days: int = 1, static=None, events: int = 0,
+             norm: bool = False):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
     prog = bar(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
-                                        bin_days=bin_days, static=static, events=events):
+                                        bin_days=bin_days, static=static, events=events,
+                                        norm=norm):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
@@ -438,7 +447,8 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
 
 
 def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
-                   bin_days: int = 1, static=None, events: int = 0) -> np.ndarray:
+                   bin_days: int = 1, static=None, events: int = 0,
+                   norm: bool = False) -> np.ndarray:
     """Скрытые состояния для всех строк — матрица (len(rows), hidden).
 
     Хранится во float16: точность здесь не критична (бустинг всё равно режет
@@ -520,7 +530,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             st = None if train_static is None else train_static[ci]
             ax = None if train_aux is None else train_aux[ci]
             for x, s, yb, ab, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                           ylog, shuffle=True, rng=rng, bin_days=args.bin, events=args.events,
+                                           ylog, shuffle=True, rng=rng, bin_days=args.bin, events=args.events, norm=args.self_norm,
                                            static=st, aux=ax):
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
@@ -664,6 +674,9 @@ def main() -> None:
                     help="событийное представление: сколько последних активных дней "
                          "подавать токенами вместо дневной сетки (0 — сетка). "
                          "Промежутки в днях идут отдельными каналами age и gap")
+    ap.add_argument("--self-norm", action="store_true",
+                    help="делить каналы клиента на его же среднее по окну: сеть "
+                         "видит форму и тайминг, масштаб приходит рангами")
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.1)
@@ -853,7 +866,8 @@ def main() -> None:
     append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
         "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
         "feat_ver": (f"seq{len(CHANNELS)}x{args.lookback}"
-                     + (f"e{args.events}" if args.events else f"b{args.bin}")),
+                     + (f"e{args.events}" if args.events else f"b{args.bin}")
+                     + ("n" if args.self_norm else "")),
         "blocks": "seq",
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
         "n_features": n_input_channels(args.events),
@@ -878,6 +892,7 @@ def main() -> None:
                                  + (f"events={args.events} " if args.events
                                     else f"bin={args.bin} ")
                                  + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                 + (" +self-norm" if args.self_norm else "")
                  + (f" +static:{args.static}" if args.static else "")
                  + (f" +residual:{args.residual}" if args.residual else "")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
