@@ -93,7 +93,12 @@ SHARE_SOURCE = [("gmv", "day_gmv"), ("to_ord", "day_ord"), ("searches", "day_sea
 RANK_CHANNELS = ["rank_gmv", "rank_ord", "rank_searches"]
 RANK_SOURCE = ["gmv", "to_ord", "searches"]
 
-CHANNELS = RAW_CHANNELS + SHARE_CHANNELS + RANK_CHANNELS
+# Каналы первого прохода: всё, что берётся из строки лога напрямую. Дневные
+# ранги сюда не входят — их считает fill_day_ranks вторым проходом, потому что
+# ранг берётся по столбцу матрицы, а первый проход идёт по строкам.
+BASE_CHANNELS = RAW_CHANNELS + SHARE_CHANNELS
+
+CHANNELS = BASE_CHANNELS + RANK_CHANNELS
 
 # Как сворачивать канал при укрупнении шага (см. --bin в seq_train). Величины
 # складываются в исходной шкале — «сколько всего за неделю», — а флаги
@@ -146,7 +151,7 @@ def fill_day_ranks(arr, users: np.ndarray, lf, date_chunks: int = 6) -> None:
     истории поднимается один раз, а не по разу на день.
     """
     edges = np.linspace(0, N_DAYS, date_chunks + 1).astype(np.int64)
-    base = len(RAW_CHANNELS) + len(SHARE_CHANNELS)
+    base = len(BASE_CHANNELS)
     prog = tqdm(total=date_chunks, desc="  дневные ранги", unit="кусок", disable=None,
                 leave=False, dynamic_ncols=True)
     for i in range(date_chunks):
@@ -256,7 +261,7 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
                   for name, (num, den) in zip(SHARE_CHANNELS, SHARE_SOURCE)],
             )
             .with_columns(*[pl.col(c).cast(pl.Float32).log1p() for c in LOG_CHANNELS])
-            .select(["user_id", "_d", *CHANNELS])
+            .select(["user_id", "_d", *BASE_CHANNELS])
             .collect(engine="streaming")
         )
         if df.height == 0:
@@ -264,8 +269,8 @@ def build(rebuild: bool = False, chunks: int = 8) -> "tuple":
         # searchsorted, а не join: users отсортирован, и это дешевле любого join'а.
         ui = np.searchsorted(users, df["user_id"].to_numpy())
         di = df["_d"].to_numpy()
-        vals = df.select(CHANNELS).to_numpy().astype(np.float16)
-        arr[ui, di] = vals
+        vals = df.select(BASE_CHANNELS).to_numpy().astype(np.float16)
+        arr[ui, di, :len(BASE_CHANNELS)] = vals
         rows_total += df.height
         prog.set_postfix_str(f"пользователи {lo:,}..{hi:,}, строк {df.height:,}")
         prog.update(1)
