@@ -61,7 +61,10 @@ def main() -> None:
     ap.add_argument("--a", required=True)
     ap.add_argument("--mse-a", type=float, required=True, help="public RMSLE файла A")
     ap.add_argument("--b", required=True)
-    ap.add_argument("--mse-b", type=float, required=True, help="public RMSLE файла B")
+    ap.add_argument("--mse-b", type=float, default=None,
+                    help="public RMSLE файла B; можно опустить, если B ещё не отправлялся — "
+                         "тогда обязателен --weight, состав соберётся на заданном весе, "
+                         "а MSE файла B восстановится из ответа лидерборда (--solve-b)")
     ap.add_argument("--out", default=None, help="куда записать бленд")
     ap.add_argument("--weight", type=float, default=None,
                     help="вес B вместо оптимального: оптимум оценён по 50 000 клиентов "
@@ -72,6 +75,48 @@ def main() -> None:
     ref = pl.read_csv(SAMPLE_SUBMIT)
     ref_ids = ref["user_id"].to_numpy()
     pa, pb = load_log(args.a, ref_ids), load_log(args.b, ref_ids)
+
+    # Неотправленный партнёр: оптимум посчитать не из чего, но состав на заданном
+    # весе собрать можно — а один ответ лидерборда потом восстановит MSE партнёра
+    # точно, потому что среднее квадрата разности файлов известно офлайн.
+    if args.mse_b is None:
+        if args.weight is None:
+            raise SystemExit("без --mse-b нужен --weight: оптимальный вес вычислить не из чего")
+        wt = args.weight
+        d_ab = float(np.mean((pa - pb) ** 2))
+        print(f"A: {args.a}  RMSLE {args.mse_a:.7f}")
+        print(f"B: {args.b}  на лидерборде ещё не был")
+        print()
+        print(f"среднее квадрата разности предсказаний: {d_ab:.6f}")
+        print(f"корреляция в log1p-шкале: {np.corrcoef(pa, pb)[0, 1]:.4f}")
+        print()
+        print(f"состав на весе {wt:.4f}. После ответа лидерборда MSE партнёра")
+        print("восстанавливается точно:")
+        print(f"  MSE_C = (1-w)^2*MSE_A + w^2*MSE_B + w(1-w)*(MSE_A + MSE_B - D),  D = {d_ab:.6f}")
+        print("  разрешить относительно MSE_B — одно уравнение, одна неизвестная")
+        blended = np.clip(np.expm1((1 - wt) * pa + wt * pb), 0, None)
+        path = SUBMISSIONS / args.out if args.out else None
+        if path is None:
+            raise SystemExit("нужен --out: без оптимума считать нечего, смысл только в сборке файла")
+        if path.exists():
+            raise SystemExit(f"{path.name} уже существует — задайте другое имя")
+        pl.DataFrame({"user_id": ref["user_id"],
+                      "predict": blended.astype(np.float32)}).write_csv(path)
+        append_csv(SUBMISSIONS / "log.csv", LOG_FIELDS, {
+            "file": args.out, "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "commit": git_commit(), "name": "blend", "model": "blend",
+            "blend_w": round(wt, 4),
+            "pred_sum": round(float(blended.sum())),
+            "pred_zeros": f"{(blended < 1e-6).mean():.4f}",
+            "note": f"состав {args.a} ({args.mse_a:.7f}) и {args.b} (без оценки), "
+                    f"вес {wt:.4f}, D={d_ab:.6f} — ожидание не вычисляется"})
+        lvl = float(np.log1p(blended).mean())
+        print()
+        print(f"{path}")
+        print(f"  сумма: {blended.sum():,.0f} | уровень log1p {lvl:.5f} "
+              f"| остаточный сдвиг {2.32912 - lvl:+.5f}")
+        print("  строка записана в submissions/log.csv")
+        return
     m1, m2 = args.mse_a ** 2, args.mse_b ** 2
     d = float(np.mean((pa - pb) ** 2))
     c = (m1 + m2 - d) / 2
