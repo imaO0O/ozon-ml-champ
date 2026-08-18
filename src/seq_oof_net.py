@@ -60,6 +60,9 @@ def main() -> None:
     ap.add_argument("--static", default="rk_",
                     help="префикс статических признаков; none или - означает «без них»")
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--no-day-ranks", action="store_true",
+                    help="контрольная рука: та же матрица без каналов дневных рангов. "
+                         "Нужна, чтобы мерить их вклад на каждом срезе одним протоколом")
     ap.add_argument("--seeds", default="42",
                     help="сиды через запятую; предсказания усредняются в log1p-шкале. "
                          "Обучающий признак должен быть такой же силы, что и тестовый, "
@@ -114,6 +117,8 @@ def main() -> None:
                        "--note", f"walk-forward для стекинга, срез {cut}, сид {sd}"]
                 if args.hidden:
                     cmd += ["--save-hidden"]
+                if args.no_day_ranks:
+                    cmd += ["--no-day-ranks"]
                 if args.static:
                     cmd += ["--static", args.static]
                 if subprocess.run(cmd, cwd=SRC.parent).returncode != 0:
