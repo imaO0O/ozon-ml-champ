@@ -548,9 +548,31 @@ def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
     return out
 
 
+def win_kw(args) -> dict:
+    """Ключи представления входа одним набором — для всех путей сразу.
+
+    Зачем отдельной функцией. Ключей четыре, а мест, где готовится окно,
+    шесть: обучающие батчи, валидация внутри эпохи, итоговая валидация, сабмит,
+    масштаб каналов и выгрузка скрытых состояний. Проставленные руками, они
+    разъезжаются молча — и разъехались: `--self-norm` попал только в обучающие
+    батчи, из-за чего сеть училась на нормированном окне, а мерилась на сыром.
+    Прогон при этом не падает и выдаёт правдоподобное число.
+    """
+    return {"bin_days": args.bin, "events": args.events,
+            "norm": args.self_norm, "no_ranks": args.no_day_ranks}
+
+
 def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
+    """Масштабируются ровно те каналы, для которых посчитан масштаб.
+
+    Ширина берётся из самого `mean`, а не из `len(CHANNELS)`: число каналов
+    данных зависит от ключей представления. Срез по константе однажды уже
+    разошёлся с действительностью — при `--no-day-ranks` он захватывал каналы,
+    которых в прогоне нет.
+    """
     xb = torch.from_numpy(x).to(device, non_blocking=True)
-    xb[:, :, :len(CHANNELS)] = (xb[:, :, :len(CHANNELS)] - mean) / std
+    n = len(mean)
+    xb[:, :, :n] = (xb[:, :, :n] - mean) / std
     return xb
 
 
@@ -604,8 +626,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             st = None if train_static is None else train_static[ci]
             ax = None if train_aux is None else train_aux[ci]
             for x, s, yb, ab, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                           ylog, shuffle=True, rng=rng, bin_days=args.bin, events=args.events, norm=args.self_norm,
-                                    no_ranks=args.no_day_ranks,
+                                           ylog, shuffle=True, rng=rng, **win_kw(args),
                                            static=st, aux=ax):
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
@@ -639,7 +660,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
         if len(val_rows):
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                          mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация",
-                         bin_days=args.bin, events=args.events, static=val_static)
+                         **win_kw(args), static=val_static)
             if val_base is not None:
                 p = val_base + p          # метрика считается по полному предсказанию
             score = rmse_log(np.log1p(val_y), p)
@@ -700,7 +721,7 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
 
     rows = pos.copy()
     p_log = evaluate(model, seq, rows, TEST_CUTOFF, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin, events=args.events, static=static)
+                     mean, std, device, **win_kw(args), static=static)
     # У неизвестных пользователей searchsorted указал на чужую строку — им
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
@@ -918,7 +939,7 @@ def main() -> None:
     t0 = time.time()
     print("считаю масштаб каналов по выборке обучающих окон...", flush=True)
     mean_np, std_np = channel_stats(seq, train_rows[0], train_cuts[0], args.lookback,
-                                    seed=args.seed, bin_days=args.bin, events=args.events)
+                                    seed=args.seed, **win_kw(args))
     print(f"  готово за {time.time() - t0:.0f}s")
     mean = torch.from_numpy(mean_np).to(device)
     std = torch.from_numpy(std_np).to(device)
@@ -941,7 +962,7 @@ def main() -> None:
                                        train_aux=train_aux)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin, events=args.events, static=val_static)
+                     mean, std, device, **win_kw(args), static=val_static)
     print(f"\n--- валидация (cutoff {val_cut}) ---")
     if val_base is not None:
         report(val_y, np.expm1(np.clip(val_base, 0, None)), "бустинг")
@@ -956,7 +977,7 @@ def main() -> None:
 
     if args.save_hidden:
         z = extract_hidden(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                           mean, std, device, bin_days=args.bin, events=args.events, static=val_static)
+                           mean, std, device, **win_kw(args), static=val_static)
         path = MODELS / f"{args.name}_hidden_{val_cut}.npz"
         np.savez(path, user_id=users[val_rows], hidden=z, target=val_y)
         print(f"скрытые состояния: {path} | {z.shape[0]:,} x {z.shape[1]} "
