@@ -80,8 +80,17 @@ def solve_weight(base: str, blend: str, mse0: float, mse1: float,
 
     from config import SUBMISSIONS
 
+    # Файлы приходят с разных машин, и совпадение порядка строк - допущение,
+    # а не факт. Разошедшийся порядок здесь не заметен по среднему: d уцелеет
+    # по уровню, но E[d^2] раздуется, и вес выйдет неверным молча. Поэтому
+    # user_id сверяются явно, с падением.
+    frames = {f: pl.read_csv(SUBMISSIONS / f) for f in (base, blend)}
+    if not (frames[base]["user_id"] == frames[blend]["user_id"]).all():
+        raise SystemExit(f"порядок user_id в {base} и {blend} различается — "
+                         f"вес по такому d будет неверным")
+
     def lg(f):
-        return np.log1p(pl.read_csv(SUBMISSIONS / f)["predict"].to_numpy().astype(np.float64))
+        return np.log1p(frames[f]["predict"].to_numpy().astype(np.float64))
 
     d = lg(blend) - lg(base)
     ed2 = float((d ** 2).mean())
