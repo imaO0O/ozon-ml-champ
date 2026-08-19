@@ -60,6 +60,14 @@ def main() -> None:
     ap.add_argument("--static", default="rk_",
                     help="префикс статических признаков; none или - означает «без них»")
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--two-head", action="store_true",
+                    help="две головы: вероятность покупки x условный log1p")
+    ap.add_argument("--buy-weight", type=float, default=1.0,
+                    help="вес классификационного слагаемого при --two-head")
+    ap.add_argument("--patience", type=int, default=3,
+                    help="терпение ранней остановки. Передаётся подпроцессу явно: "
+                         "без этого рука сравнения молча уходила на умолчание, и "
+                         "два прогона отличались не только тем, что проверяли")
     ap.add_argument("--no-day-ranks", action="store_true",
                     help="контрольная рука: та же матрица без каналов дневных рангов. "
                          "Нужна, чтобы мерить их вклад на каждом срезе одним протоколом")
@@ -111,6 +119,7 @@ def main() -> None:
             if not src.exists():
                 cmd = [sys.executable, "-u", str(SRC / "seq_train.py"),
                        "--arch", args.arch, "--epochs", str(args.epochs),
+                       "--patience", str(args.patience),
                        "--lookback", str(args.lookback), "--seed", str(sd),
                        "--cutoffs", str(n), "--val-cutoff", str(cut),
                        "--save-val-pred", "--name", tag,
@@ -119,6 +128,8 @@ def main() -> None:
                     cmd += ["--save-hidden"]
                 if args.no_day_ranks:
                     cmd += ["--no-day-ranks"]
+                if args.two_head:
+                    cmd += ["--two-head", "--buy-weight", str(args.buy_weight)]
                 if args.static:
                     cmd += ["--static", args.static]
                 if subprocess.run(cmd, cwd=SRC.parent).returncode != 0:
