@@ -64,7 +64,7 @@ def main() -> None:
                     help="две головы: вероятность покупки x условный log1p")
     ap.add_argument("--buy-weight", type=float, default=1.0,
                     help="вес классификационного слагаемого при --two-head")
-    ap.add_argument("--patience", type=int, default=3,
+    ap.add_argument("--patience", type=int, default=8,
                     help="терпение ранней остановки. Передаётся подпроцессу явно: "
                          "без этого рука сравнения молча уходила на умолчание, и "
                          "два прогона отличались не только тем, что проверяли")
