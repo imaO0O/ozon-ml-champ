@@ -34,7 +34,7 @@ import numpy as np
 from config import MODELS, ROOT
 from metrics import gini_norm, report, rmse_log
 from models import GBM
-from seq_train import EXPERIMENT_FIELDS
+from seq_train import EXPERIMENT_FIELDS, SUBMIT_FIELDS
 from train import load_split, to_xy
 from utils import append_csv, git_commit
 
@@ -521,8 +521,91 @@ def gini_trade(spec: str, tols=(0.0001, 0.0002, 0.0005), seed: int = 0) -> None:
               f"{r:>10.5f}{g:>9.4f}{g - g0:>+12.4f}")
 
 
+def compose_submissions(spec: str, out: str | None, level: float, alpha: float,
+                        note: str = "") -> None:
+    """Собрать сабмит состава: произвольное число файлов со своими весами.
+
+    Отличие от --blend-submissions, который берёт ровно два файла и просто
+    смешивает их логарифмы. Здесь три вещи, без которых веса, подобранные на
+    валидации, применять к сабмитам нельзя:
+
+    1. Уровень каждого участника приводится к измеренному уровню тестового
+       окна ДО смешивания. Веса подбирались на выровненных участниках, и если
+       подать их сырыми, разница уровней подмешается в состав постоянным
+       сдвигом, пропорциональным весу.
+    2. Уровень самого состава приводится туда же. Он и так почти верен после
+       первого шага (сумма весов равна единице), но округление весов уводит.
+    3. Растяжение применяется вокруг уровня, а не вокруг нуля: иначе оно
+       сдвинуло бы среднее и испортило первые два шага.
+
+    Уровень тестового окна E[log1p(y)] известен точно и одинаков для всех
+    моделей — он выведен из одного зонда раз и навсегда (см. --derive-shift).
+    Растяжение оценивается офлайн на валидации по той же формуле
+    alpha = 1 + Cov(остаток, центрированное) / Var(центрированное).
+
+    Кривизна намеренно не применяется: на нашем составе она стоит 0.00008,
+    вчетверо ниже порога, а её базис зависит от нормировки и переносится
+    между моделями хуже растяжения.
+    """
+    import polars as pl
+
+    from config import SAMPLE_SUBMIT, SUBMISSIONS
+
+    parts = []
+    for item in spec.split(","):
+        path, _, w = item.rpartition("=")
+        if not path:
+            raise SystemExit(f"нужно вида файл.csv=вес, получено {item!r}")
+        parts.append((path.strip(), float(w)))
+    total_w = sum(w for _, w in parts)
+    if abs(total_w - 1.0) > 1e-6:
+        raise SystemExit(f"веса должны давать в сумме 1, дано {total_w:.4f}")
+
+    ref = pl.read_csv(SAMPLE_SUBMIT)["user_id"]
+    acc = None
+    print(f"{'участник':<28}{'вес':>7}{'mean log1p':>12}{'сдвиг':>10}")
+    for path, w in parts:
+        df = pl.read_csv(SUBMISSIONS / path)
+        if not (df["user_id"] == ref).all():
+            raise SystemExit(f"{path}: порядок user_id разошёлся с sample_submit")
+        lg = np.log1p(df["predict"].to_numpy().astype(np.float64))
+        shift = level - lg.mean()
+        print(f"{path:<28}{w:>7.3f}{lg.mean():>12.5f}{shift:>+10.5f}")
+        acc = (lg + shift) * w if acc is None else acc + (lg + shift) * w
+
+    acc = acc + (level - acc.mean())
+    if alpha != 1.0:
+        acc = level + alpha * (acc - level)
+        acc = acc + (level - acc.mean())
+    pred = np.clip(np.expm1(np.clip(acc, 0, None)), 0, None)
+
+    name = out or f"compose_{dt.datetime.now():%m%d_%H%M}.csv"
+    path_out = SUBMISSIONS / name
+    if path_out.exists():
+        raise SystemExit(f"{path_out.name} уже существует — задайте другой --out")
+    pl.DataFrame({"user_id": ref, "predict": pred.astype(np.float32)}).write_csv(path_out)
+    print(f"\n{path_out}")
+    print(f"  уровень {level:.5f} | растяжение {alpha:.4f} | "
+          f"mean log1p итога {acc.mean():.5f}")
+    print(f"  суммарный предсказанный GMV: {pred.sum():,.0f}")
+    append_csv(SUBMISSIONS / "log.csv", SUBMIT_FIELDS,
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "compose", "model": "blend",
+                "pred_sum": round(float(pred.sum())),
+                "pred_zeros": f"{(pred < 1e-6).mean():.4f}",
+                "note": note or ("состав: " + ", ".join(f"{f} {w:.3f}" for f, w in parts)
+                                 + f"; уровень {level}, растяжение {alpha}")})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--compose-submissions", default=None,
+                    help="собрать сабмит состава: файл.csv=вес через запятую. "
+                         "Выравнивает уровень каждого участника перед смешиванием")
+    ap.add_argument("--level", type=float, default=2.32912,
+                    help="E[log1p(y)] тестового окна, выведенное из зонда")
+    ap.add_argument("--alpha", type=float, default=1.0,
+                    help="растяжение состава, оценённое офлайн на валидации")
     ap.add_argument("--gini-trade", default=None,
                     help="максимум Gini при заданном запасе RMSLE: файлы состава "
                          "через запятую. Пользуется плоскостью кривой весов")
@@ -566,6 +649,11 @@ def main() -> None:
                          "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+
+    if args.compose_submissions:
+        compose_submissions(args.compose_submissions, args.out, args.level,
+                            args.alpha, args.note)
+        return
 
     if args.gini_trade:
         gini_trade(args.gini_trade)
