@@ -58,9 +58,9 @@ from features import build_target, scan_log
 # ради двух дней смысла нет.
 AUX_EDGES = [7, 14, 21, HORIZON]
 from metrics import report, rmse_log
-from seq_data import (CHANNELS, MEAN_CHANNELS, RANK_CHANNELS, SUM_CHANNELS,
-                      events_window, gather, history_mask, open_seq, self_norm,
-                      window_bounds)
+from seq_data import (CHANNELS, RAW_CHANNELS, MEAN_CHANNELS, RANK_CHANNELS, SUM_CHANNELS,
+                      day_index, events_window, gather, history_mask, open_seq,
+                      self_norm, window_bounds)
 from utils import append_csv, git_commit
 
 # Колонки и их порядок — ровно как в самом models/experiments.csv, а не как в
@@ -260,6 +260,81 @@ def rate_base(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
         win = gather(seq, rows[i:i + chunk], cutoff, lookback)
         out[i:i + chunk] = np.log1p(np.expm1(win[:, :, 0]).mean(axis=1) * HORIZON)
     return out
+
+
+def cohort_axes(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
+                first_day: np.ndarray, chunk: int = 4000) -> "tuple":
+    """Две величины, задающие когорту: активных дней в окне и стаж клиента.
+
+    Обе доступны на любом срезе без таргета, поэтому когорту можно определить
+    и на тесте. Активность берётся по окну, стаж — от первого события в логе.
+    """
+    n_raw = len(RAW_CHANNELS)
+    act = np.concatenate([
+        (gather(seq, rows[i:i + chunk], cutoff, lookback)[:, :, :n_raw] != 0)
+        .any(axis=2).sum(axis=1)
+        for i in range(0, len(rows), chunk)]).astype(np.float64)
+    tenure = (day_index(cutoff) - first_day[rows]).astype(np.float64)
+    return act, tenure
+
+
+def fit_cohorts(seq, train_rows, train_cuts, train_y, lookback, first_day,
+                bins: int, min_count: int = 200) -> dict:
+    """Границы когорт и среднее log1p(y) в каждой — ТОЛЬКО по обучающим срезам.
+
+    Зачем это направление. Нормировка на собственную историю провалилась
+    (см. `rate_base`), и разбор показал причину: делителем был средний темп
+    ОДНОГО клиента, оценённый по горстке покупок, — деление на такую величину
+    вносит в цель шум, а не снимает его. Единственная сработавшая нормировка,
+    ранги, опирается на порядковую статистику по 250 000 клиентов.
+
+    Когортное среднее попадает в ту же надёжную категорию: ячейка сетки
+    5x5 при 250 000 клиентов содержит тысячи наблюдений. И спрашивает оно
+    другое, чем ранг: ранг говорит «где клиент среди ВСЕХ», когорта — «сколько
+    покупают ПОХОЖИЕ на него по стажу и активности».
+
+    Утечки нет по построению: и границы, и средние считаются по срезам, чей
+    таргет целиком лежит раньше валидационного (карантин в `cutoff_split`).
+    На валидацию и тест переносится готовая таблица. Уровень при переносе
+    уедет — площадка растёт, — но это ровно тот сдвиг, который на сабмите
+    правится бесплатно, а нас интересует структура между когортами.
+
+    Ячейки, где наблюдений меньше `min_count`, заменяются общим средним:
+    редкая когорта оценена ненадёжно, а это ровно та ошибка, из-за которой
+    провалилась нормировка на себя.
+    """
+    axes = [cohort_axes(seq, r, c, lookback, first_day)
+            for r, c in zip(train_rows, train_cuts)]
+    act = np.concatenate([a for a, _ in axes])
+    ten = np.concatenate([t for _, t in axes])
+    y = np.concatenate([np.log1p(v) for v in train_y])
+
+    q = np.linspace(0, 100, bins + 1)[1:-1]
+    e_act = np.unique(np.percentile(act, q))
+    e_ten = np.unique(np.percentile(ten, q))
+    ia = np.digitize(act, e_act)
+    it = np.digitize(ten, e_ten)
+    na, nt = len(e_act) + 1, len(e_ten) + 1
+
+    flat = ia * nt + it
+    cnt = np.bincount(flat, minlength=na * nt)
+    tot = np.bincount(flat, weights=y, minlength=na * nt)
+    glob = float(y.mean())
+    means = np.where(cnt >= min_count, tot / np.maximum(cnt, 1), glob)
+
+    weak = int((cnt > 0).sum() - (cnt >= min_count).sum())
+    print(f"когорты: {na}x{nt} = {na * nt} ячеек, заполнено {int((cnt > 0).sum())}, "
+          f"из них редких {weak} -> общее среднее {glob:.4f}")
+    print(f"  разброс когортных средних: {means[cnt >= min_count].min():.4f} .. "
+          f"{means[cnt >= min_count].max():.4f}")
+    return {"e_act": e_act, "e_ten": e_ten, "nt": nt, "means": means, "glob": glob}
+
+
+def cohort_base(seq, rows, cutoff, lookback, first_day, coh: dict) -> np.ndarray:
+    """Когортное среднее для каждой строки — база остатка."""
+    act, ten = cohort_axes(seq, rows, cutoff, lookback, first_day)
+    flat = np.digitize(act, coh["e_act"]) * coh["nt"] + np.digitize(ten, coh["e_ten"])
+    return coh["means"][np.clip(flat, 0, len(coh["means"]) - 1)]
 
 
 def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
@@ -812,7 +887,7 @@ def predict_empty(model, args, mean, std, device) -> float:
 
 
 def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict,
-                    static=None) -> None:
+                    static=None, coh=None) -> None:
     """Сабмит на 250k пользователей из sample_submit тем же форматом, что predict.py."""
     sub_users = pl.read_csv(SAMPLE_SUBMIT)["user_id"].to_numpy()
     pos = np.searchsorted(users, sub_users)
@@ -829,6 +904,11 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
         p_log[~known] = predict_empty(model, args, mean, std, device)
+    if coh is not None:
+        base = cohort_base(seq, rows, TEST_CUTOFF, args.lookback, first_day, coh)
+        print(f"  когортная база добавляется обратно: mean base {base.mean():.4f}, "
+              f"mean остатка {p_log.mean():+.4f}")
+        p_log = p_log + base
     if args.norm_target:
         base = rate_base(seq, rows, TEST_CUTOFF, args.lookback)
         print(f"  наивный темп добавляется обратно: mean base {base.mean():.4f}, "
@@ -882,6 +962,11 @@ def main() -> None:
     ap.add_argument("--no-day-ranks", action="store_true",
                     help="отрезать три дневных ранга — контрольная рука A/B "
                          "на той же матрице")
+    ap.add_argument("--cohort-base", type=int, default=0,
+                    help="частичный пулинг: цель = log1p(y) минус среднее своей "
+                         "когорты по стажу и активности. Число задаёт сетку "
+                         "квантилей на ось (5 = 25 ячеек). Средние считаются "
+                         "только по обучающим срезам")
     ap.add_argument("--two-head", action="store_true",
                     help="две головы: вероятность покупки x условный log1p, как "
                          "двухголовая схема бустинга. Предсказание — произведение")
@@ -1031,7 +1116,20 @@ def main() -> None:
         print(f"статические признаки: {len(cols)} колонок по префиксу '{args.static}' "
               f"({', '.join(cols[:4])}, ...)")
 
-    train_base = val_base = None
+    train_base = val_base = coh = None
+    if args.cohort_base:
+        if args.residual or args.norm_target:
+            raise SystemExit("--cohort-base, --norm-target и --residual все задают "
+                             "базу остатка, вместе они бессмысленны")
+        coh = fit_cohorts(seq, train_rows, train_cuts, train_y, args.lookback,
+                          first_day, args.cohort_base)
+        train_base = [cohort_base(seq, r, c, args.lookback, first_day, coh)
+                      for c, r in zip(train_cuts, train_rows)]
+        val_base = cohort_base(seq, val_rows, val_cut, args.lookback, first_day, coh)
+        print(f"  когортная база сама по себе: RMSLE "
+              f"{rmse_log(np.log1p(val_y), val_base):.5f}")
+        print(f"  остаток: среднее {(np.log1p(val_y) - val_base).mean():+.4f} | "
+              f"std {(np.log1p(val_y) - val_base).std():.4f}")
     if args.norm_target:
         if args.residual:
             raise SystemExit("--norm-target и --residual оба задают базу остатка, "
@@ -1132,6 +1230,7 @@ def main() -> None:
                                  + (f"events={args.events} " if args.events
                                     else f"bin={args.bin} ")
                                  + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                 + (f" +cohort:{args.cohort_base}" if args.cohort_base else "")
                  + (f" +two-head:{args.buy_weight}" if args.two_head else "")
                  + (" +self-norm" if args.self_norm else "")
                  + (" +norm-target" if args.norm_target else "")
@@ -1178,7 +1277,7 @@ def main() -> None:
         rows_test = np.clip(np.searchsorted(users, sub_users), 0, len(users) - 1)
         test_static, _ = load_static(TEST_CUTOFF, users, rows_test, args.static,
                                      with_target=False)
-    make_submission(final, seq, users, first_day, args, mean, std, device, res,
+    make_submission(final, seq, users, first_day, args, mean, std, device, res, coh=coh,
                     static=test_static)
 
 
