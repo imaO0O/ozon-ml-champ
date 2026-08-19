@@ -447,7 +447,7 @@ class SeqNet(nn.Module):
 
     def __init__(self, n_ch: int, hidden: int = 128, layers: int = 1, arch: str = "gru",
                  dropout: float = 0.1, lookback: int = 180, heads: int = 4,
-                 n_static: int = 0, n_aux: int = 0):
+                 n_static: int = 0, n_aux: int = 0, two_head: bool = False):
         super().__init__()
         self.arch = arch
         self.n_static = n_static
@@ -483,7 +483,16 @@ class SeqNet(nn.Module):
             nn.LayerNorm(head_in), nn.Linear(head_in, hidden), nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.head_out = nn.Linear(hidden, 1 + n_aux)
+        # Двухголовая схема: тот же приём, что у бустинга (clf x reg). Половина
+        # клиентов не покупает вовсе, и для них верный ответ ровно ноль. Одна
+        # регрессионная голова вынуждена выражать этот ноль той же величиной,
+        # что и размер чека; две головы разводят «купит ли» и «сколько».
+        #
+        # Раскладка точная, а не приближение: log1p(0) = 0, поэтому
+        # E[log1p(y)] = P(купит) * E[log1p(y) | купит]. Произведение и есть
+        # предсказание, отдельной калибровки оно не требует.
+        self.two_head = two_head
+        self.head_out = nn.Linear(hidden, 1 + n_aux + (1 if two_head else 0))
 
     def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
         h = self.inp(x)
@@ -537,7 +546,7 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
                 p = model(xb, sb)
             # Первый выход — основная голова. Остальные, если они есть, живут
             # только на обучении и в предсказание не идут.
-            out[take] = p[:, 0].float().cpu().numpy()
+            out[take] = head_predict(model, p).float().cpu().numpy()
             prog.update(1)
     prog.close()
     return out
@@ -569,6 +578,18 @@ def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
             prog.update(1)
     prog.close()
     return out
+
+
+def head_predict(model, out: torch.Tensor) -> torch.Tensor:
+    """Свести выход головы к одному числу в log1p-шкале.
+
+    У одноголовой сети это первый столбец. У двухголовой — произведение
+    вероятности покупки на условную величину: log1p(0) = 0, поэтому
+    E[log1p(y)] = P(купит) * E[log1p(y) | купит] точно, без поправок.
+    """
+    if getattr(model, "two_head", False):
+        return torch.sigmoid(out[:, -1]) * out[:, 0]
+    return out[:, 0]
 
 
 def win_kw(args) -> dict:
@@ -615,7 +636,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     n_static = 0 if train_static is None else train_static[0].shape[1]
     n_aux = 0 if train_aux is None else train_aux[0].shape[1]
     model = SeqNet(n_ch, args.hidden, args.layers, args.arch,
-                   args.dropout, steps, args.heads, n_static, n_aux).to(device)
+                   args.dropout, steps, args.heads, n_static, n_aux,
+                   two_head=args.two_head).to(device)
     n_par = sum(p.numel() for p in model.parameters())
     shape = (f"= {steps} событий из {args.lookback} дней" if args.events
              else f"= {steps} шагов по {args.bin} дн.")
@@ -656,15 +678,34 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                 tb = torch.from_numpy(yb).float().to(device)
                 with autocast(device):
                     p = model(xb, sb)
-                    loss = nn.functional.mse_loss(p[:, 0], tb)
-                    main = float(loss)
+                    if model.two_head:
+                        # Условная голова учится ТОЛЬКО на покупателях: у
+                        # остальных условной величины не существует, и подача
+                        # им нуля притянула бы её к нулю на всех.
+                        buy = (tb > 0).float()
+                        cls = nn.functional.binary_cross_entropy_with_logits(
+                            p[:, -1], buy)
+                        n_buy = buy.sum().clamp(min=1.0)
+                        cond = (((p[:, 0] - tb) ** 2) * buy).sum() / n_buy
+                        loss = cond + args.buy_weight * cls
+                        # В отчётный RMSE идёт итоговое произведение, иначе
+                        # числа несравнимы с одноголовыми прогонами.
+                        main = float(nn.functional.mse_loss(
+                            head_predict(model, p).detach(), tb))
+                    else:
+                        loss = nn.functional.mse_loss(p[:, 0], tb)
+                        main = float(loss)
                     if ab is not None:
                         # Вспомогательные головы влияют только на градиент:
                         # в отчётный RMSE идёт основная, иначе числа стали бы
                         # несравнимы с прежними прогонами.
                         aux_t = torch.from_numpy(ab).float().to(device)
+                        # При двух головах логит покупки стоит последним
+                        # столбцом, и в срез вспомогательных голов он попадать
+                        # не должен — иначе его тянули бы к суммам подокон.
+                        aux_p = p[:, 1:-1] if model.two_head else p[:, 1:]
                         loss = loss + args.aux_weight * nn.functional.mse_loss(
-                            p[:, 1:], aux_t)
+                            aux_p, aux_t)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -728,7 +769,7 @@ def predict_empty(model, args, mean, std, device) -> float:
         sb = (None if not model.n_static else
               torch.zeros((1, model.n_static), dtype=torch.float32, device=device))
         with autocast(device):
-            return float(model(xb, sb)[:, 0].float().cpu().numpy()[0])
+            return float(head_predict(model, model(xb, sb)).float().cpu().numpy()[0])
 
 
 def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict,
@@ -802,6 +843,11 @@ def main() -> None:
     ap.add_argument("--no-day-ranks", action="store_true",
                     help="отрезать три дневных ранга — контрольная рука A/B "
                          "на той же матрице")
+    ap.add_argument("--two-head", action="store_true",
+                    help="две головы: вероятность покупки x условный log1p, как "
+                         "двухголовая схема бустинга. Предсказание — произведение")
+    ap.add_argument("--buy-weight", type=float, default=1.0,
+                    help="вес классификационного слагаемого при --two-head")
     ap.add_argument("--norm-target", action="store_true",
                     help="делить и цель на собственный уровень клиента: сеть учит "
                          "отношение к наивной экстраполяции темпа. Пара к --self-norm")
@@ -1037,6 +1083,7 @@ def main() -> None:
                                  + (f"events={args.events} " if args.events
                                     else f"bin={args.bin} ")
                                  + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                 + (f" +two-head:{args.buy_weight}" if args.two_head else "")
                  + (" +self-norm" if args.self_norm else "")
                  + (" +norm-target" if args.norm_target else "")
                  + (" -day-ranks" if args.no_day_ranks else "")
