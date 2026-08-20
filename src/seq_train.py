@@ -548,7 +548,8 @@ class SeqNet(nn.Module):
 
     def __init__(self, n_ch: int, hidden: int = 128, layers: int = 1, arch: str = "gru",
                  dropout: float = 0.1, lookback: int = 180, heads: int = 4,
-                 n_static: int = 0, n_aux: int = 0, two_head: bool = False):
+                 n_static: int = 0, n_aux: int = 0, two_head: bool = False,
+                 n_bins: int = 0):
         super().__init__()
         self.arch = arch
         self.n_static = n_static
@@ -632,7 +633,30 @@ class SeqNet(nn.Module):
         #
         # Код оставлен: он воспроизводит отказ и стоит одного флага.
         self.two_head = two_head
-        self.head_out = nn.Linear(hidden, 1 + n_aux + (1 if two_head else 0))
+
+        # Распределительная голова: вместо одного числа — K бинов с softmax,
+        # предсказание берётся как E[log1p] = sum p_k * c_k.
+        #
+        # Зачем, если двухголовая схема уже проверена и дала ноль. Обе головы
+        # там оценивают своё распределение ТОЧКОЙ: вероятность покупки — числом,
+        # условную величину — числом. Здесь оценивается форма, а среднее
+        # читается из неё. Условное распределение log1p(gmv) бимодально:
+        # у 45.9% клиентов таргет ровно ноль (log1p(0) = 0 — атом в нуле),
+        # у остальных тяжёлый хвост. Средним такого распределения L2-регрессия
+        # управляет косвенно, сдвигая одну точку под градиентом.
+        #
+        # Метрике нужно ровно E[log1p(y) | x], и распределительная голова даёт
+        # его напрямую. Побочно она делает решение вероятностным: появляются
+        # P(y = 0), квантили и интервал — то, чего у точечной модели нет
+        # по построению, а не по недостатку обучения.
+        #
+        # Центры бинов лежат буфером, а не константой снаружи: они часть
+        # обученной модели и обязаны переживать save/load вместе с весами.
+        self.n_bins = n_bins
+        if n_bins:
+            self.register_buffer("centers", torch.zeros(n_bins))
+        width = n_bins if n_bins else 1 + (1 if two_head else 0)
+        self.head_out = nn.Linear(hidden, width + n_aux)
 
     def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
         h = self.inp(x)
@@ -727,6 +751,13 @@ def head_predict(model, out: torch.Tensor) -> torch.Tensor:
     вероятности покупки на условную величину: log1p(0) = 0, поэтому
     E[log1p(y)] = P(купит) * E[log1p(y) | купит] точно, без поправок.
     """
+    n_bins = getattr(model, "n_bins", 0)
+    if n_bins:
+        # Softmax по бинам, среднее по центрам. В float32 намеренно: в bf16
+        # у softmax по 64 бинам не хватает мантиссы, и E[log1p] дрожит
+        # в четвёртом знаке — на нашем пороге различимости это заметно.
+        p = torch.softmax(out[:, :n_bins].float(), dim=1)
+        return p @ model.centers.float()
     if getattr(model, "two_head", False):
         return torch.sigmoid(out[:, -1]) * out[:, 0]
     return out[:, 0]
@@ -760,6 +791,52 @@ def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
     return xb
 
 
+def make_bins(train_y: list, n_bins: int):
+    """Границы и центры бинов распределительной головы — по обучающим срезам.
+
+    Нулю отводится ОТДЕЛЬНЫЙ бин, а не крайний квантильный: log1p(0) = 0 ровно,
+    и там сидит 45.9% клиентов. Смешать этот атом с малыми положительными
+    значениями значило бы усреднить его с ними и потерять ровно то, ради чего
+    голова и заводится.
+
+    Остальные K-1 бинов режутся по квантилям положительной части, поэтому
+    наполнены одинаково. Центр каждого — СРЕДНЕЕ log1p внутри него, а не
+    середина отрезка: метрике нужна оценка среднего, а хвост скошен, и середина
+    вносила бы смещение, растущее к правому краю.
+
+    Утечки нет: валидационные таргеты сюда не попадают, границы считаются
+    только по обучающим срезам и дальше применяются как есть.
+    """
+    y = np.concatenate([np.log1p(v) for v in train_y])
+    pos = y[y > 0]
+    if n_bins < 3 or len(pos) < n_bins:
+        raise SystemExit(f"--bins {n_bins}: бинов должно быть не меньше трёх "
+                         f"и не больше числа положительных таргетов")
+    # n_bins-2 внутренних границы делят положительную часть на n_bins-1 бинов;
+    # плюс атом нуля — итого n_bins. Совпавшие границы схлопываются: при тяжёлых
+    # совпадениях значений бинов окажется меньше заказанного, и это правильно —
+    # пустой бин с центром из воздуха хуже, чем честно меньшее число бинов.
+    edges = np.unique(np.quantile(pos, np.linspace(0, 1, n_bins)[1:-1]))
+    idx = bin_index(y, edges)
+    centers = np.zeros(len(edges) + 2, dtype=np.float64)
+    for k in range(1, len(centers)):
+        take = idx == k
+        if not take.any():
+            raise SystemExit(f"--bins {n_bins}: бин {k} пуст — квантили вырождены, "
+                             f"уменьшите число бинов")
+        centers[k] = y[take].mean()
+    if not np.all(np.diff(centers) > 0):
+        raise SystemExit("центры бинов не монотонны — это дефект разбиения, "
+                         "предсказание по ним не имеет смысла")
+    return edges, centers
+
+
+def bin_index(ylog: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Номер бина по таргету в log1p-шкале: 0 — ровно ноль, дальше по границам."""
+    idx = 1 + np.searchsorted(edges, ylog, side="right")
+    return np.where(ylog > 0, idx, 0).astype(np.int64)
+
+
 def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, args,
                 mean, std, device, epochs: int | None = None,
                 train_base=None, val_base=None, train_static=None, val_static=None,
@@ -775,9 +852,24 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     n_ch = n_input_channels(args.events, args.no_day_ranks)
     n_static = 0 if train_static is None else train_static[0].shape[1]
     n_aux = 0 if train_aux is None else train_aux[0].shape[1]
+    n_bins = getattr(args, "bins", 0)
+    edges = centers = None
+    if n_bins:
+        # Разбиение строится ДО модели: при совпавших квантилях фактических
+        # бинов может оказаться меньше заказанного, и ширина головы должна
+        # равняться фактическому числу, а не желаемому.
+        edges, centers = make_bins(train_y, n_bins)
+        n_bins = len(centers)
     model = SeqNet(n_ch, args.hidden, args.layers, args.arch,
                    args.dropout, steps, args.heads, n_static, n_aux,
-                   two_head=args.two_head).to(device)
+                   two_head=args.two_head, n_bins=n_bins).to(device)
+    if n_bins:
+        with torch.no_grad():
+            model.centers.copy_(torch.from_numpy(centers).float())
+        share0 = float(np.mean(np.concatenate([np.log1p(v) for v in train_y]) == 0))
+        print(f"распределительная голова: {n_bins} бинов | атом в нуле — "
+              f"{share0:.1%} обучающих таргетов | центры от {centers[1]:.3f} "
+              f"до {centers[-1]:.3f}")
     n_par = sum(p.numel() for p in model.parameters())
     shape = (f"= {steps} событий из {args.lookback} дней" if args.events
              else f"= {steps} шагов по {args.bin} дн.")
@@ -816,9 +908,19 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
                 tb = torch.from_numpy(yb).float().to(device)
+                ib = (None if not model.n_bins else
+                      torch.from_numpy(bin_index(yb, edges)).to(device))
                 with autocast(device):
                     p = model(xb, sb)
-                    if model.two_head:
+                    if model.n_bins:
+                        # Учим форму кросс-энтропией, а в отчётный RMSE кладём
+                        # то же, что уйдёт в сабмит, — среднее по распределению.
+                        # Иначе числа этого прогона несравнимы с прежними.
+                        loss = nn.functional.cross_entropy(
+                            p[:, :model.n_bins].float(), ib)
+                        main = float(nn.functional.mse_loss(
+                            head_predict(model, p).detach(), tb))
+                    elif model.two_head:
                         # Условная голова учится ТОЛЬКО на покупателях: у
                         # остальных условной величины не существует, и подача
                         # им нуля притянула бы её к нулю на всех.
@@ -843,7 +945,8 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                         # При двух головах логит покупки стоит последним
                         # столбцом, и в срез вспомогательных голов он попадать
                         # не должен — иначе его тянули бы к суммам подокон.
-                        aux_p = p[:, 1:-1] if model.two_head else p[:, 1:]
+                        aux_p = (p[:, model.n_bins:] if model.n_bins else
+                                 (p[:, 1:-1] if model.two_head else p[:, 1:]))
                         loss = loss + args.aux_weight * nn.functional.mse_loss(
                             aux_p, aux_t)
                 opt.zero_grad(set_to_none=True)
@@ -993,6 +1096,11 @@ def main() -> None:
                          "когорты по стажу и активности. Число задаёт сетку "
                          "квантилей на ось (5 = 25 ячеек). Средние считаются "
                          "только по обучающим срезам")
+    ap.add_argument("--bins", type=int, default=0,
+                    help="распределительная голова: K бинов с softmax вместо одного "
+                         "числа, предсказание = E[log1p] по распределению. Ноль — "
+                         "выключена. Разумное значение 64: меньше огрубляет хвост, "
+                         "больше нечем наполнить")
     ap.add_argument("--two-head", action="store_true",
                     help="две головы: вероятность покупки x условный log1p, как "
                          "двухголовая схема бустинга. Предсказание — произведение")
@@ -1096,6 +1204,17 @@ def main() -> None:
         trimmed = args.lookback - args.lookback % args.bin
         print(f"окно {args.lookback} не делится на шаг {args.bin} — "
               f"беру {trimmed} дней ({trimmed // args.bin} шагов), лишние отрезаны с дальнего конца")
+
+    if args.bins:
+        if args.two_head:
+            raise SystemExit("--bins и --two-head взаимоисключающие: обе задают "
+                             "форму головы. Распределительная голова уже включает "
+                             "вероятность нуля отдельным бином")
+        if args.residual or args.norm_target or args.cohort_base:
+            raise SystemExit("--bins несовместим с базой остатка (--residual, "
+                             "--norm-target, --cohort-base): бин нуля определён "
+                             "через log1p(y) = 0, а после вычитания базы ноль "
+                             "перестаёт быть нулём и атом рассыпается")
         args.lookback = trimmed
     parse_date = dt.date.fromisoformat
     val_cut, train_cuts = cutoff_split(
