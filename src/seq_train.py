@@ -918,8 +918,18 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                         # Иначе числа этого прогона несравнимы с прежними.
                         loss = nn.functional.cross_entropy(
                             p[:, :model.n_bins].float(), ib)
-                        main = float(nn.functional.mse_loss(
-                            head_predict(model, p).detach(), tb))
+                        mean_p = head_predict(model, p)
+                        main = float(nn.functional.mse_loss(mean_p.detach(), tb))
+                        # Кросс-энтропия — правильная функция для распределения,
+                        # но метрике нужно только его среднее. При ограниченной
+                        # ёмкости часть её уходит на форму хвоста, которая
+                        # на среднее почти не влияет. --bin-mse добавляет
+                        # прямое слагаемое по среднему; ноль оставляет чистую
+                        # кросс-энтропию, и это умолчание — чтобы первый замер
+                        # проверял ровно одну вещь.
+                        if args.bin_mse:
+                            loss = loss + args.bin_mse * nn.functional.mse_loss(
+                                mean_p, tb)
                     elif model.two_head:
                         # Условная голова учится ТОЛЬКО на покупателях: у
                         # остальных условной величины не существует, и подача
@@ -1101,6 +1111,10 @@ def main() -> None:
                          "числа, предсказание = E[log1p] по распределению. Ноль — "
                          "выключена. Разумное значение 64: меньше огрубляет хвост, "
                          "больше нечем наполнить")
+    ap.add_argument("--bin-mse", type=float, default=0.0,
+                    help="вес прямого слагаемого по среднему в дополнение "
+                         "к кросс-энтропии при --bins. Ноль — чистая "
+                         "кросс-энтропия")
     ap.add_argument("--two-head", action="store_true",
                     help="две головы: вероятность покупки x условный log1p, как "
                          "двухголовая схема бустинга. Предсказание — произведение")
