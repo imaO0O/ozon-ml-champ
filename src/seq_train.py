@@ -58,8 +58,9 @@ from features import build_target, scan_log
 # ради двух дней смысла нет.
 AUX_EDGES = [7, 14, 21, HORIZON]
 from metrics import report, rmse_log
-from seq_data import (CHANNELS, MEAN_CHANNELS, SUM_CHANNELS, gather, history_mask,
-                      open_seq, window_bounds)
+from seq_data import (CHANNELS, RAW_CHANNELS, MEAN_CHANNELS, RANK_CHANNELS, SUM_CHANNELS,
+                      day_index, events_window, gather, history_mask, open_seq,
+                      self_norm, window_bounds)
 from utils import append_csv, git_commit
 
 # Колонки и их порядок — ровно как в самом models/experiments.csv, а не как в
@@ -114,6 +115,29 @@ def cutoff_split(n_cutoffs: int, val_cutoff: dt.date | None = None,
     признаков (по 400 МБ на срез), которые сети не нужны совсем. Правило одно,
     и при его изменении в train.py эту функцию надо поправить следом.
     """
+    # Шаг между срезами 30 дней совпадает с HORIZON, и это не совпадение, а
+    # единственно верный выбор — проверено прямым замером.
+    #
+    #     срезов  шаг  перекрытие таргетов  выровненный RMSLE
+    #        5     30          0%               1.67051
+    #       18     15         50%               1.67169
+    #       18      7         77%               1.67253
+    #
+    # Монотонно хуже с плотностью. Механизм: таргет это сумма за [c, c+30), и
+    # при шаге меньше 30 дней соседние срезы делят одни и те же покупки. Модель
+    # получает не новую информацию, а повторы уже виденного ответа — окон
+    # больше вчетверо, а независимых наблюдений столько же. Видно и по обучению:
+    # при шаге 7 train RMSE уходит на 1.708 против прежнего потолка 1.73, то
+    # есть сеть начинает запоминать дубликаты, а валидация при этом портится
+    # с восьмой эпохи.
+    #
+    # Свежесть здесь ни при чём: плотные срезы только по свежему периоду
+    # (август-декабрь, доля покупателей 52.8-56.3% против 54.07% на валидации)
+    # оказались ХУЖЕ плотных вглубь до апреля. Сначала мы объяснили провал
+    # шага 15 сдвигом распределения — объяснение не подтвердилось.
+    #
+    # Отсюда: 30 дней это наименьший шаг с непересекающимися таргетами, и
+    # уменьшать его нельзя. Увеличивать тоже незачем — данных станет меньше.
     cuts = train_cutoffs(n_cutoffs)
     val_cut = val_cutoff or cuts[0]
     train_cuts = explicit_train if explicit_train else [c for c in cuts if c < val_cut]
@@ -182,6 +206,163 @@ def aux_targets(cutoff: dt.date, users: np.ndarray, rows: np.ndarray) -> np.ndar
     return out[rows]
 
 
+def rate_base(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
+              chunk: int = 4000) -> np.ndarray:
+    """Наивная экстраполяция темпа: log1p(средний дневной gmv в окне * HORIZON).
+
+    Пара к `--self-norm`, без которой та нормировка неполна. Деля каналы на
+    собственное среднее клиента, мы забираем у сети масштаб; если при этом цель
+    остаётся абсолютной, сеть обязана масштаб восстановить — из 27 рангов, то
+    есть решить лишнюю и чужую для неё задачу. Именно так был поставлен первый
+    замер, и он провалился (см. `self_norm` в seq_data.py).
+
+    Здесь масштаб не восстанавливается, а возвращается умножением: цель тоже
+    делится на собственный уровень клиента. Сеть учит чистое отношение «сколько
+    он купит за 30 дней относительно своего обычного темпа», а уровень
+    приходит обратно готовым числом.
+
+    Считается тем же механизмом, что `--residual`: база вычитается из цели на
+    обучении и прибавляется к предсказанию везде, включая сабмит.
+
+    Клиент без покупок в окне даёт базу log1p(0) = 0, и цель остаётся исходной —
+    отдельной ветки не нужно.
+
+    Утечки нет: окно обрывается на дне перед cutoff'ом.
+
+    ПРОВЕРЕНО И ОТВЕРГНУТО, вместе с --self-norm --static rk_ на обоих срезах:
+
+        январь (выровнено)  сетка 1.67292 -> вход+цель 1.68160   -0.00868
+        декабрь             сетка 1.73735 -> вход+цель 1.74766   -0.01031
+
+    Но пара действительно нужна была: вес в оптимальном составе поднялся с
+    **-0.197** у неполной версии (делили только вход) до **-0.021** у полной.
+    Постановка была верной, величины не хватило — ноль вместо вреда.
+
+    Почему не хватило. Делитель оценивается по тем же разреженным данным, что
+    и всё остальное: средний дневной gmv за 90 дней у клиента с одной покупкой
+    — оценка почти без точности. Деление на неё не снимает шум масштаба,
+    а вносит его в цель, причём ровно у тех клиентов, которые и так труднее
+    всех. Видно по остатку: std 1.9653 против 2.09355 RMSLE у самой наивной
+    экстраполяции — цель стала не проще, а шумнее.
+
+    Отсюда уточнение правила из `self_norm`: убирать информацию нормировкой
+    можно только на делитель, оценённый надёжно. Ранги работают именно поэтому
+    — это порядковые статистики по 250 000 клиентов, а не отношение двух
+    разреженных сумм.
+
+    Побочно: Gini у этой сети 0.7351 — лучший среди всех наших сетей (0.7345
+    у плотной, 0.7337 у рангов). По величине она хуже, а упорядочивает лучше.
+    В RMSLE-оптимальный состав она не входит, но для tie-breaker'а это
+    единственная сеть, которая тянет Gini вверх, а не вниз.
+    """
+    out = np.empty(len(rows), dtype=np.float64)
+    for i in range(0, len(rows), chunk):
+        win = gather(seq, rows[i:i + chunk], cutoff, lookback)
+        out[i:i + chunk] = np.log1p(np.expm1(win[:, :, 0]).mean(axis=1) * HORIZON)
+    return out
+
+
+def cohort_axes(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
+                first_day: np.ndarray, chunk: int = 4000) -> "tuple":
+    """Две величины, задающие когорту: активных дней в окне и стаж клиента.
+
+    Обе доступны на любом срезе без таргета, поэтому когорту можно определить
+    и на тесте. Активность берётся по окну, стаж — от первого события в логе.
+    """
+    n_raw = len(RAW_CHANNELS)
+    act = np.concatenate([
+        (gather(seq, rows[i:i + chunk], cutoff, lookback)[:, :, :n_raw] != 0)
+        .any(axis=2).sum(axis=1)
+        for i in range(0, len(rows), chunk)]).astype(np.float64)
+    tenure = (day_index(cutoff) - first_day[rows]).astype(np.float64)
+    return act, tenure
+
+
+def fit_cohorts(seq, train_rows, train_cuts, train_y, lookback, first_day,
+                bins: int, min_count: int = 200) -> dict:
+    """Границы когорт и среднее log1p(y) в каждой — ТОЛЬКО по обучающим срезам.
+
+    Зачем это направление. Нормировка на собственную историю провалилась
+    (см. `rate_base`), и разбор показал причину: делителем был средний темп
+    ОДНОГО клиента, оценённый по горстке покупок, — деление на такую величину
+    вносит в цель шум, а не снимает его. Единственная сработавшая нормировка,
+    ранги, опирается на порядковую статистику по 250 000 клиентов.
+
+    Когортное среднее попадает в ту же надёжную категорию: ячейка сетки
+    5x5 при 250 000 клиентов содержит тысячи наблюдений. И спрашивает оно
+    другое, чем ранг: ранг говорит «где клиент среди ВСЕХ», когорта — «сколько
+    покупают ПОХОЖИЕ на него по стажу и активности».
+
+    Утечки нет по построению: и границы, и средние считаются по срезам, чей
+    таргет целиком лежит раньше валидационного (карантин в `cutoff_split`).
+    На валидацию и тест переносится готовая таблица. Уровень при переносе
+    уедет — площадка растёт, — но это ровно тот сдвиг, который на сабмите
+    правится бесплатно, а нас интересует структура между когортами.
+
+    Ячейки, где наблюдений меньше `min_count`, заменяются общим средним:
+    редкая когорта оценена ненадёжно, а это ровно та ошибка, из-за которой
+    провалилась нормировка на себя.
+
+    ОТВЕРГНУТО, и вместе с ним закрыто всё семейство. Три сида, январь,
+    уровень выровнен: 1.68318 против 1.67012 без пулинга, то есть -0.01306.
+
+    Причина не в когортах, а в форме цели, и она общая для всех наших попыток
+    пересадить цель на базу:
+
+        --residual на предсказании бустинга   +0.0111 сырых -> 0.00000
+        --norm-target наивный темп            остаток std 1.9653
+        --cohort-base когортное среднее       остаток std 1.9999, -0.01306
+
+    У 45.9% клиентов таргет РОВНО ноль, а log1p(0) = 0. Любая положительная
+    база даёт этой половине выборки остаток около -2.36 при собственном
+    разбросе цели 2.288. База ничего не снимает — она добавляет половине
+    клиентов большое постоянное смещение, которое сеть потом обязана
+    предсказывать заново.
+
+    Диагностика видна ДО обучения и стоит одной строки: если `std` остатка не
+    меньше `std` цели, база вредна. У всех трёх наших баз она была не меньше.
+
+    Отсюда единственная допустимая форма базы в этой задаче: не аддитивная,
+    а взвешенная вероятностью покупки, `P(купит) * условное среднее` — тогда
+    у непокупателя база сама стремится к нулю. Это ровно двухголовая схема,
+    которая у бустинга работает, а у сети оказалась нейтральной (-0.00005,
+    см. `SeqNet.two_head`). То есть правильная форма уже проверена, и больше
+    в этом направлении брать нечего.
+    """
+    axes = [cohort_axes(seq, r, c, lookback, first_day)
+            for r, c in zip(train_rows, train_cuts)]
+    act = np.concatenate([a for a, _ in axes])
+    ten = np.concatenate([t for _, t in axes])
+    y = np.concatenate([np.log1p(v) for v in train_y])
+
+    q = np.linspace(0, 100, bins + 1)[1:-1]
+    e_act = np.unique(np.percentile(act, q))
+    e_ten = np.unique(np.percentile(ten, q))
+    ia = np.digitize(act, e_act)
+    it = np.digitize(ten, e_ten)
+    na, nt = len(e_act) + 1, len(e_ten) + 1
+
+    flat = ia * nt + it
+    cnt = np.bincount(flat, minlength=na * nt)
+    tot = np.bincount(flat, weights=y, minlength=na * nt)
+    glob = float(y.mean())
+    means = np.where(cnt >= min_count, tot / np.maximum(cnt, 1), glob)
+
+    weak = int((cnt > 0).sum() - (cnt >= min_count).sum())
+    print(f"когорты: {na}x{nt} = {na * nt} ячеек, заполнено {int((cnt > 0).sum())}, "
+          f"из них редких {weak} -> общее среднее {glob:.4f}")
+    print(f"  разброс когортных средних: {means[cnt >= min_count].min():.4f} .. "
+          f"{means[cnt >= min_count].max():.4f}")
+    return {"e_act": e_act, "e_ten": e_ten, "nt": nt, "means": means, "glob": glob}
+
+
+def cohort_base(seq, rows, cutoff, lookback, first_day, coh: dict) -> np.ndarray:
+    """Когортное среднее для каждой строки — база остатка."""
+    act, ten = cohort_axes(seq, rows, cutoff, lookback, first_day)
+    flat = np.digitize(act, coh["e_act"]) * coh["nt"] + np.digitize(ten, coh["e_ten"])
+    return coh["means"][np.clip(flat, 0, len(coh["means"]) - 1)]
+
+
 def load_base(name: str, tag: str, users: np.ndarray, rows: np.ndarray) -> np.ndarray:
     """Предсказание бустинга из seq_oof, выровненное по строкам матрицы.
 
@@ -242,15 +423,22 @@ def load_static(cutoff: dt.date, users: np.ndarray, rows: np.ndarray,
 
 
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
-                  sample: int = 20000, seed: int = SEED, bin_days: int = 1):
+                  sample: int = 20000, seed: int = SEED, bin_days: int = 1,
+                  events: int = 0, norm: bool = False, no_ranks: bool = False):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
 
     Считать по всем данным нельзя: в выборку попал бы валидационный срез.
     Масштабируются только 12 каналов лога, `observed` остаётся 0/1.
+
+    В событийном режиме `age` и `gap` тоже остаются несмасштабированными: обе
+    величины уже в log1p и лежат в разумном диапазоне, а вычитать из них среднее
+    нельзя — у добивки они честно нулевые, и сдвиг сделал бы её значимой.
     """
     rng = np.random.default_rng(seed)
     sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
-    x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)[:, :, :len(CHANNELS)]
+    n_data = len(CHANNELS) - (len(RANK_CHANNELS) if no_ranks else 0)
+    x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events,
+                    norm, no_ranks)[:, :, :n_data]
     mean = x.mean(axis=(0, 1))
     std = x.std(axis=(0, 1))
     std[std < 1e-6] = 1.0
@@ -287,16 +475,54 @@ def bin_window(x: np.ndarray, bin_days: int) -> np.ndarray:
     return out
 
 
+def drop_day_ranks(x: np.ndarray) -> np.ndarray:
+    """Отрезать дневные ранги — контрольная рука A/B на той же матрице.
+
+    Иначе сравнивать пришлось бы с числами, снятыми на матрице прошлого
+    поколения, то есть в другом прогоне и на другом железе. С этим ключом обе
+    руки идут с одного файла, и разница остаётся ровно в каналах.
+    """
+    keep = len(CHANNELS) - len(RANK_CHANNELS)
+    return np.concatenate([x[:, :, :keep], x[:, :, len(CHANNELS):]], axis=2)
+
+
+def prep_window(x: np.ndarray, bin_days: int, events: int,
+                norm: bool = False, no_ranks: bool = False) -> np.ndarray:
+    """Представление окна: дневная сетка, укрупнённые шаги или события.
+
+    Взаимоисключающие ветки — оба преобразования читают ось дней, и применять
+    их подряд бессмысленно: после укрупнения «активный день» уже не день.
+
+    Нормировка на собственную историю применяется до них: она работает по дням,
+    и её среднее должно считаться по исходной сетке, а не по укрупнённой.
+    """
+    if norm:
+        x = self_norm(x)
+    if no_ranks:
+        x = drop_day_ranks(x)
+    if events:
+        return events_window(x, events)
+    return bin_window(x, bin_days)
+
+
+def n_input_channels(events: int, no_ranks: bool = False) -> int:
+    """Сколько каналов увидит сеть: у событий их на два больше (`age`, `gap`)."""
+    n = len(CHANNELS) - (len(RANK_CHANNELS) if no_ranks else 0)
+    return n + (3 if events else 1)
+
+
 def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: int,
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
             bin_days: int = 1, static: np.ndarray | None = None,
-            aux: np.ndarray | None = None):
+            aux: np.ndarray | None = None, events: int = 0, norm: bool = False,
+            no_ranks: bool = False):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
-        x = bin_window(gather(seq, sel, cutoff, lookback), bin_days)
+        x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events, norm,
+                        no_ranks)
         s = None if static is None else static[take]
         a = None if aux is None else aux[take]
         yield x, s, (None if y is None else y[take]), a, take
@@ -322,7 +548,7 @@ class SeqNet(nn.Module):
 
     def __init__(self, n_ch: int, hidden: int = 128, layers: int = 1, arch: str = "gru",
                  dropout: float = 0.1, lookback: int = 180, heads: int = 4,
-                 n_static: int = 0, n_aux: int = 0):
+                 n_static: int = 0, n_aux: int = 0, two_head: bool = False):
         super().__init__()
         self.arch = arch
         self.n_static = n_static
@@ -358,7 +584,55 @@ class SeqNet(nn.Module):
             nn.LayerNorm(head_in), nn.Linear(head_in, hidden), nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.head_out = nn.Linear(hidden, 1 + n_aux)
+        # Двухголовая схема: тот же приём, что у бустинга (clf x reg). Половина
+        # клиентов не покупает вовсе, и для них верный ответ ровно ноль. Одна
+        # регрессионная голова вынуждена выражать этот ноль той же величиной,
+        # что и размер чека; две головы разводят «купит ли» и «сколько».
+        #
+        # Раскладка точная, а не приближение: log1p(0) = 0, поэтому
+        # E[log1p(y)] = P(купит) * E[log1p(y) | купит]. Произведение и есть
+        # предсказание, отдельной калибровки оно не требует.
+        # ПРОВЕРЕНО И ПРИНЯТО. Три сида на срез, уровень выровнен, против
+        # одноголовой сети того же протокола (netoof_dr, тоже три сида):
+        #
+        #     январь   1.67113 -> 1.66973   +0.00140
+        #     декабрь  1.73754 -> 1.73608   +0.00146
+        #
+        # Совпадение до пятого знака между срезами — самая согласованная
+        # величина за всю работу. В оптимальном составе двухголовая получает
+        # 0.179 и 0.379, а одноголовая уходит в минус на обоих срезах: она
+        # вытесняется полностью.
+        #
+        # Осторожно: одиночные прогоны давали -0.00096 на январе и +0.00101 на
+        # декабре, то есть «знак скачет, отвергнуть». Три сида перевернули
+        # вывод. Это третий случай за два дня, когда одиночный прогон соврал.
+        #
+        # Состав целиком выигрывает меньше самой сети: +0.00006 на январе и
+        # +0.00034 на декабре. Причина понятна — стекинг уже несёт информацию
+        # сети признаком, и большая часть улучшения достаётся ему, а не бленду.
+        # Отсюда следующий шаг: пересобрать OOF и стекинг на двухголовой.
+        # ОТВЕРГНУТО. Замер сначала показал +0.00140 на январе и +0.00146 на
+        # декабре против одноголовой, три сида, и был почти принят. Но руки
+        # отличались не только головой: одноголовая база собиралась через
+        # seq_oof_net, который не передавал --patience, то есть училась с
+        # терпением 3, а двухголовая — с 8. Контроль с одинаковым терпением:
+        #
+        #     одна голова, терпение 3   1.67113
+        #     одна голова, терпение 8   1.66968     вклад терпения  +0.00146
+        #     две головы,  терпение 8   1.66973     вклад головы    -0.00005
+        #
+        # Вся величина была длительностью обучения. Вторая голова не даёт
+        # ничего и слегка портит Gini (0.7355 против 0.7364).
+        #
+        # Механизм провала, вероятно, в том, что раскладка точна, но не даёт
+        # новой информации: обе головы читают одно скрытое состояние, и сеть
+        # способна выразить произведение и одним выходом. У бустинга схема
+        # работает по другой причине — там это два РАЗНЫХ обучения с разными
+        # функциями потерь на разных подвыборках.
+        #
+        # Код оставлен: он воспроизводит отказ и стоит одного флага.
+        self.two_head = two_head
+        self.head_out = nn.Linear(hidden, 1 + n_aux + (1 if two_head else 0))
 
     def forward(self, x: torch.Tensor, s: torch.Tensor | None = None) -> torch.Tensor:
         h = self.inp(x)
@@ -396,28 +670,31 @@ class SeqNet(nn.Module):
 # --------------------------------------------------------------------------- обучение
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
-             desc: str = "предсказание", bin_days: int = 1, static=None):
+             desc: str = "предсказание", bin_days: int = 1, static=None, events: int = 0,
+             norm: bool = False, no_ranks: bool = False):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
     prog = bar(-(-len(rows) // batch_size), desc)
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
-                                        bin_days=bin_days, static=static):
+                                        bin_days=bin_days, static=static, events=events,
+                                        norm=norm, no_ranks=no_ranks):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
                 p = model(xb, sb)
             # Первый выход — основная голова. Остальные, если они есть, живут
             # только на обучении и в предсказание не идут.
-            out[take] = p[:, 0].float().cpu().numpy()
+            out[take] = head_predict(model, p).float().cpu().numpy()
             prog.update(1)
     prog.close()
     return out
 
 
 def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
-                   bin_days: int = 1, static=None) -> np.ndarray:
+                   bin_days: int = 1, static=None, events: int = 0,
+                   norm: bool = False, no_ranks: bool = False) -> np.ndarray:
     """Скрытые состояния для всех строк — матрица (len(rows), hidden).
 
     Хранится во float16: точность здесь не критична (бустинг всё равно режет
@@ -429,7 +706,7 @@ def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
     prog = bar(-(-len(rows) // batch_size), "скрытые состояния")
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
-                                        bin_days=bin_days, static=static):
+                                        bin_days=bin_days, static=static, events=events):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
@@ -443,9 +720,43 @@ def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
     return out
 
 
+def head_predict(model, out: torch.Tensor) -> torch.Tensor:
+    """Свести выход головы к одному числу в log1p-шкале.
+
+    У одноголовой сети это первый столбец. У двухголовой — произведение
+    вероятности покупки на условную величину: log1p(0) = 0, поэтому
+    E[log1p(y)] = P(купит) * E[log1p(y) | купит] точно, без поправок.
+    """
+    if getattr(model, "two_head", False):
+        return torch.sigmoid(out[:, -1]) * out[:, 0]
+    return out[:, 0]
+
+
+def win_kw(args) -> dict:
+    """Ключи представления входа одним набором — для всех путей сразу.
+
+    Зачем отдельной функцией. Ключей четыре, а мест, где готовится окно,
+    шесть: обучающие батчи, валидация внутри эпохи, итоговая валидация, сабмит,
+    масштаб каналов и выгрузка скрытых состояний. Проставленные руками, они
+    разъезжаются молча — и разъехались: `--self-norm` попал только в обучающие
+    батчи, из-за чего сеть училась на нормированном окне, а мерилась на сыром.
+    Прогон при этом не падает и выдаёт правдоподобное число.
+    """
+    return {"bin_days": args.bin, "events": args.events,
+            "norm": args.self_norm, "no_ranks": args.no_day_ranks}
+
+
 def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
+    """Масштабируются ровно те каналы, для которых посчитан масштаб.
+
+    Ширина берётся из самого `mean`, а не из `len(CHANNELS)`: число каналов
+    данных зависит от ключей представления. Срез по константе однажды уже
+    разошёлся с действительностью — при `--no-day-ranks` он захватывал каналы,
+    которых в прогоне нет.
+    """
     xb = torch.from_numpy(x).to(device, non_blocking=True)
-    xb[:, :, :len(CHANNELS)] = (xb[:, :, :len(CHANNELS)] - mean) / std
+    n = len(mean)
+    xb[:, :, :n] = (xb[:, :, :n] - mean) / std
     return xb
 
 
@@ -460,14 +771,18 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     итераций фиксируется заранее).
     """
     torch.manual_seed(args.seed)
-    steps = args.lookback // args.bin
+    steps = args.events or args.lookback // args.bin
+    n_ch = n_input_channels(args.events, args.no_day_ranks)
     n_static = 0 if train_static is None else train_static[0].shape[1]
     n_aux = 0 if train_aux is None else train_aux[0].shape[1]
-    model = SeqNet(len(CHANNELS) + 1, args.hidden, args.layers, args.arch,
-                   args.dropout, steps, args.heads, n_static, n_aux).to(device)
+    model = SeqNet(n_ch, args.hidden, args.layers, args.arch,
+                   args.dropout, steps, args.heads, n_static, n_aux,
+                   two_head=args.two_head).to(device)
     n_par = sum(p.numel() for p in model.parameters())
+    shape = (f"= {steps} событий из {args.lookback} дней" if args.events
+             else f"= {steps} шагов по {args.bin} дн.")
     print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней "
-          f"= {steps} шагов по {args.bin} дн. | {len(CHANNELS) + 1} каналов"
+          f"{shape} | {n_ch} каналов"
           f"{f' + {n_static} рангов' if n_static else ''}"
           f"{f' | + {n_aux} вспомогательных голов, вес {args.aux_weight}' if n_aux else ''}"
           f" | устройство {device}")
@@ -496,22 +811,41 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
             st = None if train_static is None else train_static[ci]
             ax = None if train_aux is None else train_aux[ci]
             for x, s, yb, ab, _ in batches(seq, rows, cut, args.lookback, args.batch_size,
-                                           ylog, shuffle=True, rng=rng, bin_days=args.bin,
+                                           ylog, shuffle=True, rng=rng, **win_kw(args),
                                            static=st, aux=ax):
                 xb = to_device(x, mean, std, device)
                 sb = None if s is None else torch.from_numpy(s).float().to(device)
                 tb = torch.from_numpy(yb).float().to(device)
                 with autocast(device):
                     p = model(xb, sb)
-                    loss = nn.functional.mse_loss(p[:, 0], tb)
-                    main = float(loss)
+                    if model.two_head:
+                        # Условная голова учится ТОЛЬКО на покупателях: у
+                        # остальных условной величины не существует, и подача
+                        # им нуля притянула бы её к нулю на всех.
+                        buy = (tb > 0).float()
+                        cls = nn.functional.binary_cross_entropy_with_logits(
+                            p[:, -1], buy)
+                        n_buy = buy.sum().clamp(min=1.0)
+                        cond = (((p[:, 0] - tb) ** 2) * buy).sum() / n_buy
+                        loss = cond + args.buy_weight * cls
+                        # В отчётный RMSE идёт итоговое произведение, иначе
+                        # числа несравнимы с одноголовыми прогонами.
+                        main = float(nn.functional.mse_loss(
+                            head_predict(model, p).detach(), tb))
+                    else:
+                        loss = nn.functional.mse_loss(p[:, 0], tb)
+                        main = float(loss)
                     if ab is not None:
                         # Вспомогательные головы влияют только на градиент:
                         # в отчётный RMSE идёт основная, иначе числа стали бы
                         # несравнимы с прежними прогонами.
                         aux_t = torch.from_numpy(ab).float().to(device)
+                        # При двух головах логит покупки стоит последним
+                        # столбцом, и в срез вспомогательных голов он попадать
+                        # не должен — иначе его тянули бы к суммам подокон.
+                        aux_p = p[:, 1:-1] if model.two_head else p[:, 1:]
                         loss = loss + args.aux_weight * nn.functional.mse_loss(
-                            p[:, 1:], aux_t)
+                            aux_p, aux_t)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -530,7 +864,7 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
         if len(val_rows):
             p = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
                          mean, std, device, desc=f"эпоха {epoch}/{n_epochs} валидация",
-                         bin_days=args.bin, static=val_static)
+                         **win_kw(args), static=val_static)
             if val_base is not None:
                 p = val_base + p          # метрика считается по полному предсказанию
             score = rmse_log(np.log1p(val_y), p)
@@ -558,9 +892,16 @@ def predict_empty(model, args, mean, std, device) -> float:
 
     `observed = 1` намеренно: дни существовали, активности в них не было —
     это не то же самое, что «данных за эти дни нет».
+
+    В событийном режиме такой клиент даёт пустую последовательность: ни одного
+    токена, все `valid` нулевые. Это ровно тот вход, который событийное
+    представление и обязано отдавать в этом случае, — добивать его нечем.
     """
-    x = np.zeros((1, args.lookback // args.bin, len(CHANNELS) + 1), dtype=np.float32)
-    x[:, :, len(CHANNELS)] = 1.0
+    steps = args.events or args.lookback // args.bin
+    n_ch = n_input_channels(args.events, args.no_day_ranks)
+    x = np.zeros((1, steps, n_ch), dtype=np.float32)
+    if not args.events:
+        x[:, :, n_ch - 1] = 1.0
     model.eval()
     with torch.no_grad():
         xb = to_device(x, mean, std, device)
@@ -568,11 +909,11 @@ def predict_empty(model, args, mean, std, device) -> float:
         sb = (None if not model.n_static else
               torch.zeros((1, model.n_static), dtype=torch.float32, device=device))
         with autocast(device):
-            return float(model(xb, sb)[:, 0].float().cpu().numpy()[0])
+            return float(head_predict(model, model(xb, sb)).float().cpu().numpy()[0])
 
 
 def make_submission(model, seq, users, first_day, args, mean, std, device, meta: dict,
-                    static=None) -> None:
+                    static=None, coh=None) -> None:
     """Сабмит на 250k пользователей из sample_submit тем же форматом, что predict.py."""
     sub_users = pl.read_csv(SAMPLE_SUBMIT)["user_id"].to_numpy()
     pos = np.searchsorted(users, sub_users)
@@ -584,11 +925,21 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
 
     rows = pos.copy()
     p_log = evaluate(model, seq, rows, TEST_CUTOFF, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin, static=static)
+                     mean, std, device, **win_kw(args), static=static)
     # У неизвестных пользователей searchsorted указал на чужую строку — им
     # положено предсказание по пустой истории, а не по соседу из индекса.
     if (~known).sum():
         p_log[~known] = predict_empty(model, args, mean, std, device)
+    if coh is not None:
+        base = cohort_base(seq, rows, TEST_CUTOFF, args.lookback, first_day, coh)
+        print(f"  когортная база добавляется обратно: mean base {base.mean():.4f}, "
+              f"mean остатка {p_log.mean():+.4f}")
+        p_log = p_log + base
+    if args.norm_target:
+        base = rate_base(seq, rows, TEST_CUTOFF, args.lookback)
+        print(f"  наивный темп добавляется обратно: mean base {base.mean():.4f}, "
+              f"mean остатка {p_log.mean():+.4f}")
+        p_log = p_log + base
     if args.residual:
         # Тот же объект, что и в обучении: бустинг, обученный на всех срезах.
         base = load_base(args.residual, "test", users, rows)
@@ -630,12 +981,45 @@ def main() -> None:
                     help="сколько дней в одном шаге последовательности: 1 — по дням, "
                          "7 — по неделям (180 дней превращаются в 26 плотных шагов). "
                          "Длина окна должна делиться на это число")
+    ap.add_argument("--events", type=int, default=0,
+                    help="событийное представление: сколько последних активных дней "
+                         "подавать токенами вместо дневной сетки (0 — сетка). "
+                         "Промежутки в днях идут отдельными каналами age и gap")
+    ap.add_argument("--no-day-ranks", action="store_true",
+                    help="отрезать три дневных ранга — контрольная рука A/B "
+                         "на той же матрице")
+    ap.add_argument("--cohort-base", type=int, default=0,
+                    help="частичный пулинг: цель = log1p(y) минус среднее своей "
+                         "когорты по стажу и активности. Число задаёт сетку "
+                         "квантилей на ось (5 = 25 ячеек). Средние считаются "
+                         "только по обучающим срезам")
+    ap.add_argument("--two-head", action="store_true",
+                    help="две головы: вероятность покупки x условный log1p, как "
+                         "двухголовая схема бустинга. Предсказание — произведение")
+    ap.add_argument("--buy-weight", type=float, default=1.0,
+                    help="вес классификационного слагаемого при --two-head")
+    ap.add_argument("--norm-target", action="store_true",
+                    help="делить и цель на собственный уровень клиента: сеть учит "
+                         "отношение к наивной экстраполяции темпа. Пара к --self-norm")
+    ap.add_argument("--self-norm", action="store_true",
+                    help="делить каналы клиента на его же среднее по окну: сеть "
+                         "видит форму и тайминг, масштаб приходит рангами")
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--heads", type=int, default=4, help="только для transformer")
     ap.add_argument("--epochs", type=int, default=12)
-    ap.add_argument("--patience", type=int, default=3)
+    # Терпение 8, а не 3. Прямой замер, три сида, январь, уровень выровнен:
+    #
+    #     терпение 3   1.67113
+    #     терпение 8   1.66968     +0.00146
+    #
+    # Это больше, чем дали дневные ранги, и досталось бесплатно — мы полтора
+    # месяца недоучивали каждую сеть. Кривая валидации у нас шумная, лучшая
+    # эпоха при терпении 8 приходится на 11-13-ю, а терпение 3 обрывало прогон
+    # на 3-6-й. Подтверждение на декабре: та же сеть с терпением 3 остановилась
+    # на ПЕРВОЙ эпохе (1.74312), с терпением 6 дошла до шестнадцатой (1.73728).
+    ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-2)
@@ -705,6 +1089,9 @@ def main() -> None:
     # Бины выравниваются по cutoff'у: последний шаг это дни, непосредственно
     # предшествующие срезу. Поэтому лишние дни отрезаются с дальнего конца,
     # где они стоят дешевле всего — рецентность решает в этой задаче больше всего.
+    if args.events and args.bin > 1:
+        raise SystemExit("--events и --bin взаимоисключающие: после укрупнения "
+                         "шага «активный день» перестаёт быть днём")
     if args.lookback % args.bin:
         trimmed = args.lookback - args.lookback % args.bin
         print(f"окно {args.lookback} не делится на шаг {args.bin} — "
@@ -755,7 +1142,32 @@ def main() -> None:
         print(f"статические признаки: {len(cols)} колонок по префиксу '{args.static}' "
               f"({', '.join(cols[:4])}, ...)")
 
-    train_base = val_base = None
+    train_base = val_base = coh = None
+    if args.cohort_base:
+        if args.residual or args.norm_target:
+            raise SystemExit("--cohort-base, --norm-target и --residual все задают "
+                             "базу остатка, вместе они бессмысленны")
+        coh = fit_cohorts(seq, train_rows, train_cuts, train_y, args.lookback,
+                          first_day, args.cohort_base)
+        train_base = [cohort_base(seq, r, c, args.lookback, first_day, coh)
+                      for c, r in zip(train_cuts, train_rows)]
+        val_base = cohort_base(seq, val_rows, val_cut, args.lookback, first_day, coh)
+        print(f"  когортная база сама по себе: RMSLE "
+              f"{rmse_log(np.log1p(val_y), val_base):.5f}")
+        print(f"  остаток: среднее {(np.log1p(val_y) - val_base).mean():+.4f} | "
+              f"std {(np.log1p(val_y) - val_base).std():.4f}")
+    if args.norm_target:
+        if args.residual:
+            raise SystemExit("--norm-target и --residual оба задают базу остатка, "
+                             "вместе они бессмысленны")
+        print("цель делится на собственный уровень: "
+              "цель = log1p(y) - log1p(средний дневной gmv в окне * 30)")
+        train_base = [rate_base(seq, r, c, args.lookback)
+                      for c, r in zip(train_cuts, train_rows)]
+        val_base = rate_base(seq, val_rows, val_cut, args.lookback)
+        print(f"  наивный темп сам по себе: RMSLE {rmse_log(np.log1p(val_y), val_base):.5f}")
+        print(f"  остаток: среднее {(np.log1p(val_y) - val_base).mean():+.4f} | "
+              f"std {(np.log1p(val_y) - val_base).std():.4f}")
     if args.residual:
         print(f"режим остатка: цель = log1p(y) - предсказание бустинга ({args.residual})")
         train_base = [load_base(args.residual, c.isoformat(), users, r)
@@ -769,7 +1181,7 @@ def main() -> None:
     t0 = time.time()
     print("считаю масштаб каналов по выборке обучающих окон...", flush=True)
     mean_np, std_np = channel_stats(seq, train_rows[0], train_cuts[0], args.lookback,
-                                    seed=args.seed, bin_days=args.bin)
+                                    seed=args.seed, **win_kw(args))
     print(f"  готово за {time.time() - t0:.0f}s")
     mean = torch.from_numpy(mean_np).to(device)
     std = torch.from_numpy(std_np).to(device)
@@ -792,7 +1204,7 @@ def main() -> None:
                                        train_aux=train_aux)
 
     p_log = evaluate(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                     mean, std, device, bin_days=args.bin, static=val_static)
+                     mean, std, device, **win_kw(args), static=val_static)
     print(f"\n--- валидация (cutoff {val_cut}) ---")
     if val_base is not None:
         report(val_y, np.expm1(np.clip(val_base, 0, None)), "бустинг")
@@ -807,7 +1219,7 @@ def main() -> None:
 
     if args.save_hidden:
         z = extract_hidden(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
-                           mean, std, device, bin_days=args.bin, static=val_static)
+                           mean, std, device, **win_kw(args), static=val_static)
         path = MODELS / f"{args.name}_hidden_{val_cut}.npz"
         np.savez(path, user_id=users[val_rows], hidden=z, target=val_y)
         print(f"скрытые состояния: {path} | {z.shape[0]:,} x {z.shape[1]} "
@@ -815,9 +1227,14 @@ def main() -> None:
 
     append_csv(MODELS / "experiments.csv", EXPERIMENT_FIELDS, {
         "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
-        "feat_ver": f"seq{len(CHANNELS)}x{args.lookback}b{args.bin}", "blocks": "seq",
+        "feat_ver": (f"seq{len(CHANNELS)}x{args.lookback}"
+                     + (f"e{args.events}" if args.events else f"b{args.bin}")
+                     + ("n" if args.self_norm else "")
+                     + ("t" if args.norm_target else "")
+                     + ("-rk" if args.no_day_ranks else "")),
+        "blocks": "seq",
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
-        "n_features": len(CHANNELS) + 1,
+        "n_features": n_input_channels(args.events, args.no_day_ranks),
         "rmsle_single": round(res["rmsle"], 5), "rmsle_two_stage": "",
         # rmsle_blend дублирует rmsle_single: у сети одна голова, а команда
         # сравнивает строки журнала именно по этой колонке.
@@ -835,8 +1252,15 @@ def main() -> None:
         "note": ((f"ПОДВЫБОРКА train={args.subsample or 'полн'} "
                   f"val={args.val_subsample or 'полн'}; " if args.subsample or args.val_subsample else "")
                  + (args.note or f"{args.arch} hidden={args.hidden} layers={args.layers} "
-                                 f"lookback={args.lookback} bin={args.bin} "
-                                 f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                                 f"lookback={args.lookback} "
+                                 + (f"events={args.events} " if args.events
+                                    else f"bin={args.bin} ")
+                                 + f"ch={len(CHANNELS)} bs={args.batch_size} lr={args.lr}")
+                 + (f" +cohort:{args.cohort_base}" if args.cohort_base else "")
+                 + (f" +two-head:{args.buy_weight}" if args.two_head else "")
+                 + (" +self-norm" if args.self_norm else "")
+                 + (" +norm-target" if args.norm_target else "")
+                 + (" -day-ranks" if args.no_day_ranks else "")
                  + (f" +static:{args.static}" if args.static else "")
                  + (f" +residual:{args.residual}" if args.residual else "")
                  + f" [{device.type}/{precision} seed={args.seed}]"),
@@ -879,7 +1303,7 @@ def main() -> None:
         rows_test = np.clip(np.searchsorted(users, sub_users), 0, len(users) - 1)
         test_static, _ = load_static(TEST_CUTOFF, users, rows_test, args.static,
                                      with_target=False)
-    make_submission(final, seq, users, first_day, args, mean, std, device, res,
+    make_submission(final, seq, users, first_day, args, mean, std, device, res, coh=coh,
                     static=test_static)
 
 

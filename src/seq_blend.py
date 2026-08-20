@@ -34,7 +34,7 @@ import numpy as np
 from config import MODELS, ROOT
 from metrics import gini_norm, report, rmse_log
 from models import GBM
-from seq_train import EXPERIMENT_FIELDS
+from seq_train import EXPERIMENT_FIELDS, SUBMIT_FIELDS
 from train import load_split, to_xy
 from utils import append_csv, git_commit
 
@@ -80,8 +80,17 @@ def solve_weight(base: str, blend: str, mse0: float, mse1: float,
 
     from config import SUBMISSIONS
 
+    # Файлы приходят с разных машин, и совпадение порядка строк - допущение,
+    # а не факт. Разошедшийся порядок здесь не заметен по среднему: d уцелеет
+    # по уровню, но E[d^2] раздуется, и вес выйдет неверным молча. Поэтому
+    # user_id сверяются явно, с падением.
+    frames = {f: pl.read_csv(SUBMISSIONS / f) for f in (base, blend)}
+    if not (frames[base]["user_id"] == frames[blend]["user_id"]).all():
+        raise SystemExit(f"порядок user_id в {base} и {blend} различается — "
+                         f"вес по такому d будет неверным")
+
     def lg(f):
-        return np.log1p(pl.read_csv(SUBMISSIONS / f)["predict"].to_numpy().astype(np.float64))
+        return np.log1p(frames[f]["predict"].to_numpy().astype(np.float64))
 
     d = lg(blend) - lg(base)
     ed2 = float((d ** 2).mean())
@@ -420,8 +429,186 @@ def sweep_weights(spec: str, at: str | None, tol: float = 0.0001) -> None:
           f"ценой не больше {tol} RMSLE")
 
 
+def gini_trade(spec: str, tols=(0.0001, 0.0002, 0.0005), seed: int = 0) -> None:
+    """Сколько Gini можно купить, почти не платя RMSLE.
+
+    Зачем. Жюри смотрит два критерия, и по второму состав слабее собственного
+    бустинга: 0.7365 против 0.7377. При этом кривая весов измеренно плоская —
+    сдвиг на 0.08-0.12 в любую сторону стоит не больше 0.0001 RMSLE. Внутри
+    этого запаса веса ничем не заняты, а Gini по ним меняется: участники
+    упорядочивают клиентов по-разному, и оптимум RMSLE не обязан совпадать
+    с оптимумом упорядочивания.
+
+    Отсюда постановка: максимум Gini при условии, что RMSLE хуже своего
+    оптимума не более чем на `tol`.
+
+    Допустимое множество считается точно, а не перебором. После выравнивания
+    MSE(w) = w'Cw при sum(w) = 1, поэтому
+
+        w = w* + B t,   B — базис подпространства sum = 0
+        ограничение     t'(B'CB) t <= delta,  delta = (sqrt(MSE*) + tol)^2 - MSE*
+
+    то есть эллипсоид. Разложение Холецкого B'CB = L L' превращает его в шар:
+    при t = L^-T u ограничение это ровно ||u|| <= sqrt(delta). По шару Gini
+    ищется случайным поиском с уточнением — Gini зависит от порядка, а не от
+    величины, и гладкой формулы для него нет.
+
+    Оптимум Gini лежит на границе (внутрь двигаться незачем), поэтому выборка
+    берётся со сферы, а не из объёма.
+    """
+    rng = np.random.default_rng(seed)
+    paths = [x.strip() for x in spec.split(",") if x.strip()]
+    if len(paths) < 2:
+        raise SystemExit("нужно хотя бы два участника")
+
+    base = np.load(ROOT / paths[0])
+    uid, tgt = base["user_id"], base["target"]
+    y = np.log1p(tgt)
+
+    pred = np.empty((len(uid), len(paths)), dtype=np.float64)
+    print(f"{'участник':<44}{'RMSLE':>10}{'Gini':>9}")
+    for j, path in enumerate(paths):
+        d = np.load(ROOT / path)
+        pr = d["pred_log"]
+        if not np.array_equal(d["user_id"], uid):
+            order = np.argsort(d["user_id"])
+            pos = np.searchsorted(d["user_id"][order], uid)
+            if not np.array_equal(d["user_id"][order][pos], uid):
+                raise SystemExit(f"{path}: другой набор пользователей")
+            pr = pr[order][pos]
+        pred[:, j] = leveled(y, pr)
+        print(f"{path.split('/')[-1]:<44}{rmse_log(y, pred[:, j]):>10.5f}"
+              f"{gini_norm(tgt, np.expm1(np.clip(pred[:, j], 0, None))):>9.4f}")
+
+    k = len(paths)
+    err = pred - y[:, None]
+    cov = err.T @ err / len(uid)
+    inv1 = np.linalg.solve(cov, np.ones(k))
+    w_opt = inv1 / inv1.sum()
+    best = float(w_opt @ cov @ w_opt)
+
+    basis, _ = np.linalg.qr(np.eye(k)[:, 1:] - np.eye(k)[:, :1])
+    chol = np.linalg.cholesky(basis.T @ cov @ basis)
+
+    def score(w):
+        q = pred @ w
+        return (float(w @ cov @ w) ** 0.5,
+                gini_norm(tgt, np.expm1(np.clip(q, 0, None))))
+
+    r0, g0 = score(w_opt)
+    head = "запас RMSLE"
+    print()
+    print(f"{head:<14}{'веса':<40}{'RMSLE':>10}{'Gini':>9}{'к оптимуму':>12}")
+    print(f"{'0 (оптимум)':<14}{' '.join(f'{v:.3f}' for v in w_opt):<40}"
+          f"{r0:>10.5f}{g0:>9.4f}{'-':>12}")
+
+    for tol in tols:
+        radius = ((r0 + tol) ** 2 - best) ** 0.5
+        w_best, g_best = w_opt, g0
+        for scale in (1.0, 0.5, 0.25, 0.12):
+            centre = w_opt if scale == 1.0 else w_best
+            for _ in range(240):
+                u = rng.normal(size=k - 1)
+                u *= radius * scale / np.linalg.norm(u)
+                w = centre + basis @ np.linalg.solve(chol.T, u)
+                if float(w @ cov @ w) ** 0.5 - r0 > tol + 1e-12:
+                    continue
+                g = score(w)[1]
+                if g > g_best:
+                    w_best, g_best = w, g
+        r, g = score(w_best)
+        print(f"{tol:<14.4f}{' '.join(f'{v:.3f}' for v in w_best):<40}"
+              f"{r:>10.5f}{g:>9.4f}{g - g0:>+12.4f}")
+
+
+def compose_submissions(spec: str, out: str | None, level: float, alpha: float,
+                        note: str = "") -> None:
+    """Собрать сабмит состава: произвольное число файлов со своими весами.
+
+    Отличие от --blend-submissions, который берёт ровно два файла и просто
+    смешивает их логарифмы. Здесь три вещи, без которых веса, подобранные на
+    валидации, применять к сабмитам нельзя:
+
+    1. Уровень каждого участника приводится к измеренному уровню тестового
+       окна ДО смешивания. Веса подбирались на выровненных участниках, и если
+       подать их сырыми, разница уровней подмешается в состав постоянным
+       сдвигом, пропорциональным весу.
+    2. Уровень самого состава приводится туда же. Он и так почти верен после
+       первого шага (сумма весов равна единице), но округление весов уводит.
+    3. Растяжение применяется вокруг уровня, а не вокруг нуля: иначе оно
+       сдвинуло бы среднее и испортило первые два шага.
+
+    Уровень тестового окна E[log1p(y)] известен точно и одинаков для всех
+    моделей — он выведен из одного зонда раз и навсегда (см. --derive-shift).
+    Растяжение оценивается офлайн на валидации по той же формуле
+    alpha = 1 + Cov(остаток, центрированное) / Var(центрированное).
+
+    Кривизна намеренно не применяется: на нашем составе она стоит 0.00008,
+    вчетверо ниже порога, а её базис зависит от нормировки и переносится
+    между моделями хуже растяжения.
+    """
+    import polars as pl
+
+    from config import SAMPLE_SUBMIT, SUBMISSIONS
+
+    parts = []
+    for item in spec.split(","):
+        path, _, w = item.rpartition("=")
+        if not path:
+            raise SystemExit(f"нужно вида файл.csv=вес, получено {item!r}")
+        parts.append((path.strip(), float(w)))
+    total_w = sum(w for _, w in parts)
+    if abs(total_w - 1.0) > 1e-6:
+        raise SystemExit(f"веса должны давать в сумме 1, дано {total_w:.4f}")
+
+    ref = pl.read_csv(SAMPLE_SUBMIT)["user_id"]
+    acc = None
+    print(f"{'участник':<28}{'вес':>7}{'mean log1p':>12}{'сдвиг':>10}")
+    for path, w in parts:
+        df = pl.read_csv(SUBMISSIONS / path)
+        if not (df["user_id"] == ref).all():
+            raise SystemExit(f"{path}: порядок user_id разошёлся с sample_submit")
+        lg = np.log1p(df["predict"].to_numpy().astype(np.float64))
+        shift = level - lg.mean()
+        print(f"{path:<28}{w:>7.3f}{lg.mean():>12.5f}{shift:>+10.5f}")
+        acc = (lg + shift) * w if acc is None else acc + (lg + shift) * w
+
+    acc = acc + (level - acc.mean())
+    if alpha != 1.0:
+        acc = level + alpha * (acc - level)
+        acc = acc + (level - acc.mean())
+    pred = np.clip(np.expm1(np.clip(acc, 0, None)), 0, None)
+
+    name = out or f"compose_{dt.datetime.now():%m%d_%H%M}.csv"
+    path_out = SUBMISSIONS / name
+    if path_out.exists():
+        raise SystemExit(f"{path_out.name} уже существует — задайте другой --out")
+    pl.DataFrame({"user_id": ref, "predict": pred.astype(np.float32)}).write_csv(path_out)
+    print(f"\n{path_out}")
+    print(f"  уровень {level:.5f} | растяжение {alpha:.4f} | "
+          f"mean log1p итога {acc.mean():.5f}")
+    print(f"  суммарный предсказанный GMV: {pred.sum():,.0f}")
+    append_csv(SUBMISSIONS / "log.csv", SUBMIT_FIELDS,
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "compose", "model": "blend",
+                "pred_sum": round(float(pred.sum())),
+                "pred_zeros": f"{(pred < 1e-6).mean():.4f}",
+                "note": note or ("состав: " + ", ".join(f"{f} {w:.3f}" for f, w in parts)
+                                 + f"; уровень {level}, растяжение {alpha}")})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--compose-submissions", default=None,
+                    help="собрать сабмит состава: файл.csv=вес через запятую. "
+                         "Выравнивает уровень каждого участника перед смешиванием")
+    ap.add_argument("--level", type=float, default=2.32912,
+                    help="E[log1p(y)] тестового окна, выведенное из зонда")
+    ap.add_argument("--alpha", type=float, default=1.0,
+                    help="растяжение состава, оценённое офлайн на валидации")
+    ap.add_argument("--gini-trade", default=None,
+                    help="максимум Gini при заданном запасе RMSLE: файлы состава "
+                         "через запятую. Пользуется плоскостью кривой весов")
     ap.add_argument("--sweep", default=None,
                     help="файлы состава через запятую без весов: считает оптимум, "
                          "цену равных весов и радиус плоскости")
@@ -462,6 +649,15 @@ def main() -> None:
                          "чего собирается сабмит, но считается в разы дольше")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+
+    if args.compose_submissions:
+        compose_submissions(args.compose_submissions, args.out, args.level,
+                            args.alpha, args.note)
+        return
+
+    if args.gini_trade:
+        gini_trade(args.gini_trade)
+        return
 
     if args.sweep:
         sweep_weights(args.sweep, args.at)
