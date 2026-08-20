@@ -1218,6 +1218,7 @@ def main() -> None:
         trimmed = args.lookback - args.lookback % args.bin
         print(f"окно {args.lookback} не делится на шаг {args.bin} — "
               f"беру {trimmed} дней ({trimmed // args.bin} шагов), лишние отрезаны с дальнего конца")
+        args.lookback = trimmed
 
     if args.bins:
         if args.two_head:
@@ -1229,7 +1230,7 @@ def main() -> None:
                              "--norm-target, --cohort-base): бин нуля определён "
                              "через log1p(y) = 0, а после вычитания базы ноль "
                              "перестаёт быть нулём и атом рассыпается")
-        args.lookback = trimmed
+
     parse_date = dt.date.fromisoformat
     val_cut, train_cuts = cutoff_split(
         args.cutoffs,
