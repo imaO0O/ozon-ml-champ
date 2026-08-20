@@ -28,23 +28,35 @@ from metrics import gini_norm, rmse_log
 
 
 def load(names: list[str], cut: str):
-    """Предсказания рук в log1p и общий таргет; несколько имён — среднее сидов."""
-    preds, y = [], None
+    """Предсказания рук в log1p и общий таргет; несколько имён — среднее сидов.
+
+    Строки приводятся к порядку user_id, а не берутся как лежат. Сеть пишет их
+    в порядке валидационных строк матрицы и у обеих рук он один, а `train.py`
+    отдаёт их перемешанными — и поэлементное сравнение двух его прогонов даёт
+    корреляцию 0.0003 при совершенно правильных RMSLE у каждого по отдельности.
+    Ошибка тихая: числа выглядят осмысленными, пока не посмотришь на расстояние.
+    """
+    preds, y, ids = [], None, None
     for n in names:
         path = MODELS / f"{n}_valpred_{cut}.npz"
         if not path.exists():
             raise SystemExit(f"нет {path.name} — прогон делался без --save-val-pred?")
         z = np.load(path)
-        preds.append(z["pred_log"].astype(np.float64))
-        t = np.log1p(z["target"].astype(np.float64))
+        order = np.argsort(z["user_id"])
+        u = z["user_id"][order]
+        if ids is not None and not np.array_equal(u, ids):
+            raise SystemExit(f"{n}: другой состав user_id — разные срезы?")
+        ids = u
+        preds.append(z["pred_log"].astype(np.float64)[order])
+        t = np.log1p(z["target"].astype(np.float64))[order]
         if y is not None and not np.allclose(t, y):
             raise SystemExit(f"{n}: таргет не совпадает с предыдущими — разные срезы?")
         y = t
-    return np.mean(preds, axis=0), y, preds
+    return np.mean(preds, axis=0), y, preds, ids
 
 
-def describe(tag: str, names: list[str], cut: str) -> tuple[float, np.ndarray]:
-    p, y, preds = load(names, cut)
+def describe(tag: str, names: list[str], cut: str):
+    p, y, preds, ids = load(names, cut)
     # Выравнивание — ровно то, что делает бесплатный сдвиг на сабмите.
     aligned = p - p.mean() + y.mean()
     score = rmse_log(y, aligned)
@@ -54,7 +66,7 @@ def describe(tag: str, names: list[str], cut: str) -> tuple[float, np.ndarray]:
     if len(preds) > 1:
         print(f"{'':<13}по сидам {' '.join(f'{v:.5f}' for v in singles)} | "
               f"усреднение даёт {np.mean(singles) - score:+.5f}")
-    return score, p
+    return score, p, y, ids
 
 
 def main() -> None:
@@ -65,8 +77,10 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f"=== срез {args.cut} ===")
-    sa, pa = describe("рука A", args.a.split(","), args.cut)
-    sb, pb = describe("рука B", args.b.split(","), args.cut)
+    sa, pa, ya, ida = describe("рука A", args.a.split(","), args.cut)
+    sb, pb, yb, idb = describe("рука B", args.b.split(","), args.cut)
+    if not np.array_equal(ida, idb):
+        raise SystemExit("руки посчитаны на разных наборах клиентов — сравнивать нельзя")
     d = float(np.mean((pa - pb) ** 2))
     print(f"  B к A: {sa - sb:+.5f} | расстояние D = {d:.5f} | "
           f"корреляция {np.corrcoef(pa, pb)[0, 1]:.5f}")
