@@ -60,6 +60,12 @@ def main() -> None:
     ap.add_argument("--static", default="rk_",
                     help="префикс статических признаков; none или - означает «без них»")
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--bins", type=int, default=0,
+                    help="распределительная голова у сети: K бинов вместо одного "
+                         "числа. Передаётся подпроцессу явно — молчаливое умолчание "
+                         "здесь уже стоило команде ложного вывода про две головы")
+    ap.add_argument("--bin-mse", type=float, default=0.0,
+                    help="вес прямого слагаемого по среднему при --bins")
     ap.add_argument("--two-head", action="store_true",
                     help="две головы: вероятность покупки x условный log1p")
     ap.add_argument("--buy-weight", type=float, default=1.0,
@@ -130,6 +136,10 @@ def main() -> None:
                     cmd += ["--no-day-ranks"]
                 if args.two_head:
                     cmd += ["--two-head", "--buy-weight", str(args.buy_weight)]
+                if args.bins:
+                    cmd += ["--bins", str(args.bins)]
+                    if args.bin_mse:
+                        cmd += ["--bin-mse", str(args.bin_mse)]
                 if args.static:
                     cmd += ["--static", args.static]
                 if subprocess.run(cmd, cwd=SRC.parent).returncode != 0:
