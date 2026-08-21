@@ -75,7 +75,7 @@ python -m venv .venv && source .venv/bin/activate && pip install -r requirements
 
 ```bash
 python -u src/datasets.py --test                                  # признаки по всем срезам (кэш в data/processed)
-python -u src/train.py --cutoffs 6 --ensemble --final --name lgbm_ens
+python -u src/train.py --cutoffs 6 --ensemble --rank-stamps --final --name lgbm_ens
 python -u src/predict.py --name lgbm_ens                          # сырой сабмит в submissions/
 python -u src/probe_shift.py --derive-shift --source <сырой>.csv  # сдвиг: бесплатно, без сабмита
 python -u src/probe_shift.py --source <сырой>.csv --delta <выведенный> --out shifted.csv
@@ -101,6 +101,14 @@ python -u src/probe_shift.py --source <сырой>.csv --delta <выведенн
 python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios,platform,unit,ranks --note "без моего блока"
 python -u src/train.py --cutoffs 8 --val-cutoff 2025-12-16 --train-cutoffs 2025-06-19,2025-07-19,2025-08-18
 ```
+
+**Флаг `--rank-stamps` включать всегда.** Шесть признаков (`tenure`,
+`first_ord_ago`, `active_months`, `day_crowd_mean_30/90/365`) монотонно растут
+с датой среза и на тесте выходят за обучающий диапазон, а деревья за границу
+не экстраполируют: у 75.5% валидационных клиентов `tenure` уже за максимумом
+обучения. Флаг заменяет их процентильным рангом внутри среза — порядок
+сохраняется, привязка к дате уходит. Дало +0.00036 и +0.00077 на рабочем
+стекинге; `predict.py` применяет то же преобразование сам, по флагу из меты.
 
 Сейчас существуют шесть блоков: `windows`, `lifetime`, `ratios`, `platform`,
 `unit`, `ranks`. Полный список всегда виден в подсказке
@@ -437,6 +445,10 @@ src/binning.py            разбиение цели на бины, общее 
 src/dist_gbm.py           мультиклассовая голова у бустинга плюс диаграмма надёжности
 src/seq_cmp.py            сравнение рук сети с выравниванием уровня и усреднением сидов
 src/partners.py           кто из отправленных файлов окупается партнёром по бленду
+
+перенос на тестовое окно:
+src/shift_weights.py      поправка на сдвиг режима весами (неприменима, AUC = 1)
+src/date_stamp.py         признаки-датчики времени: сохранить, снять или ранжировать
 ```
 
 Журналы, которые лежат в git: `models/experiments.csv` (строка на каждый прогон
