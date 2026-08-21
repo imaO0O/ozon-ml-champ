@@ -29,7 +29,7 @@ from utils import append_csv, git_commit
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
                stride: int | None = None, history: int | None = None, net: bool = False,
-               net_feats: str = "rank_centered"):
+               net_feats: str = "rank_centered", drop_stamps: bool = False):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -58,6 +58,10 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
                           net_feats=net_feats)
               for c in train_cuts]
     feats = feature_names(val)
+    if drop_stamps:
+        gone = [f for f in feats if f in DATE_STAMPS]
+        feats = [f for f in feats if f not in DATE_STAMPS]
+        print(f"сняты датчики времени ({len(gone)}): {', '.join(gone)}")
     # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
     # feats берётся из колонок val, поэтому в X эта колонка не попадёт.
     trains = [
@@ -69,6 +73,22 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     train = pl.concat(trains, how="vertical")
     print(f"train: {train.height:,} строк ({len(train_cuts)} cutoff) | val: {val.height:,} ({val_cut})")
     return train, val, feats, cuts
+
+
+DATE_STAMPS = ("tenure", "first_ord_ago", "active_months",
+               "day_crowd_mean_30", "day_crowd_mean_90", "day_crowd_mean_365")
+"""Признаки, монотонно растущие с датой среза.
+
+Для одного и того же клиента они однозначно кодируют дату среза, а на тесте
+выходят за обучающий диапазон: tenure идёт 205.9 -> 337.6 по обучающим срезам,
+на тесте 367.6. Деревья за границу не экстраполируют, поэтому по разбиению
+вида `tenure > порог` весь тест уходит в одну сторону, и к нему применяется
+поправка, выученная на самом свежем обучающем срезе.
+
+Список получен измерением: дискриминатор «свежий срез против старых» даёт
+AUC = 1.0000, и 66% его выигрыша приходится на первые три из этих величин.
+Снятие их дало +0.00097 и +0.00029 на двух срезах (src/date_stamp.py).
+"""
 
 
 def to_xy(df: pl.DataFrame, feats: list[str]):
@@ -159,6 +179,11 @@ def main() -> None:
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
     ap.add_argument("--net", action="store_true",
                     help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
+    ap.add_argument("--drop-stamps", action="store_true",
+                    help="снять признаки, монотонно растущие с датой среза "
+                         "(tenure, day_crowd_mean_*, first_ord_ago, active_months). "
+                         "На тесте они выходят за обучающий диапазон, а деревья "
+                         "за него не экстраполируют — см. DATE_STAMPS")
     ap.add_argument("--net-names", default=None,
                     help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
     ap.add_argument("--save-val-pred", action="store_true",
@@ -173,7 +198,8 @@ def main() -> None:
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
-                                         stride=args.stride, net=parse_net(args.net, args.net_names))
+                                         stride=args.stride, net=parse_net(args.net, args.net_names),
+                                         drop_stamps=args.drop_stamps)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
