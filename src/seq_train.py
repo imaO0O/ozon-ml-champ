@@ -358,7 +358,7 @@ def fit_cohorts(seq, train_rows, train_cuts, train_y, lookback, first_day,
 
 
 def fit_cohort_prior(seq, train_rows, train_cuts, train_y, lookback, first_day,
-                     grid: int, edges: np.ndarray, n_bins: int,
+                     grid: int, edges: np.ndarray, centers: np.ndarray,
                      min_count: int = 200) -> dict:
     """Распределение по бинам ВНУТРИ когорты — иерархия, которая не ломается о нули.
 
@@ -384,6 +384,7 @@ def fit_cohort_prior(seq, train_rows, train_cuts, train_y, lookback, first_day,
     ten = np.concatenate([t for _, t in axes])
     y = np.concatenate([np.log1p(v) for v in train_y])
     idx = bin_index(y, edges)
+    n_bins = len(centers)
 
     q = np.linspace(0, 100, grid + 1)[1:-1]
     e_act = np.unique(np.percentile(act, q))
@@ -405,15 +406,28 @@ def fit_cohort_prior(seq, train_rows, train_cuts, train_y, lookback, first_day,
     print(f"  доля нуля по когортам: {share[total.ravel() >= min_count, 0].min():.3f}"
           f" .. {share[total.ravel() >= min_count, 0].max():.3f}"
           f" (в среднем {glob[0]:.3f})")
-    return {"e_act": e_act, "e_ten": e_ten, "nt": nt,
+    return {"e_act": e_act, "e_ten": e_ten, "nt": nt, "centers": centers,
             "logp": np.log(np.clip(share, 1e-6, None)), "glob": glob}
 
 
-def cohort_prior(seq, rows, cutoff, lookback, first_day, coh: dict) -> np.ndarray:
-    """Логарифмы долей бинов для когорты каждого клиента: (строк, бинов)."""
+def cohort_prior(seq, rows, cutoff, lookback, first_day, coh: dict,
+                 slim: bool = False) -> np.ndarray:
+    """Когортный приор на клиента: полное распределение или две сводки.
+
+    `slim` оставляет две колонки вместо K: логарифм доли нуля в когорте и её
+    ожидаемое log1p. Это разделяет две причины возможного провала полной
+    версии — мешает ли лишняя ИНФОРМАЦИЯ или лишняя ШИРИНА входа. Тот же
+    вопрос уже возникал на распределительной голове бустинга, и там ответом
+    оказалась ёмкость, а не информация.
+    """
     act, ten = cohort_axes(seq, rows, cutoff, lookback, first_day)
     flat = np.digitize(act, coh["e_act"]) * coh["nt"] + np.digitize(ten, coh["e_ten"])
-    return coh["logp"][flat].astype(np.float32)
+    logp = coh["logp"][flat]
+    if not slim:
+        return logp.astype(np.float32)
+    share = np.exp(logp)
+    share = share / share.sum(axis=1, keepdims=True)
+    return np.stack([logp[:, 0], share @ coh["centers"]], axis=1).astype(np.float32)
 
 
 def cohort_base(seq, rows, cutoff, lookback, first_day, coh: dict) -> np.ndarray:
@@ -1121,6 +1135,10 @@ def main() -> None:
                          "с --cohort-base: там когортное среднее вычиталось из цели "
                          "и ломалось о 46% нулей, здесь цель не трогается вовсе. "
                          "Требует --bins")
+    ap.add_argument("--cohort-slim", action="store_true",
+                    help="от когортного приора оставить две колонки вместо K: "
+                         "логарифм доли нуля и ожидаемое log1p. Разделяет "
+                         "причины провала полной версии - информация или ширина")
     ap.add_argument("--cohort-base", type=int, default=0,
                     help="частичный пулинг: цель = log1p(y) минус среднее своей "
                          "когорты по стажу и активности. Число задаёт сетку "
@@ -1305,14 +1323,16 @@ def main() -> None:
         # Границы бинов считаются здесь теми же входами, что и в train_model,
         # поэтому совпадают побитово. Дублирование вычисления дешевле, чем
         # протаскивание границ через полдюжины вызовов.
-        edges_p, _ = make_bins(train_y, args.bins)
+        edges_p, centers_p = make_bins(train_y, args.bins)
         coh_prior = fit_cohort_prior(seq, train_rows, train_cuts, train_y,
                                      args.lookback, first_day, args.cohort_prior,
-                                     edges_p, len(edges_p) + 2)
-        pri_tr = [cohort_prior(seq, r, c, args.lookback, first_day, coh_prior)
+                                     edges_p, centers_p)
+        pri_tr = [cohort_prior(seq, r, c, args.lookback, first_day, coh_prior,
+                               args.cohort_slim)
                   for c, r in zip(train_cuts, train_rows)]
         pri_val = cohort_prior(seq, val_rows, val_cut, args.lookback,
-                               first_day, coh_prior)
+                               first_day, coh_prior, args.cohort_slim)
+        print(f"  колонок приора на клиента: {pri_val.shape[1]}")
         if train_static is None:
             train_static, val_static = pri_tr, pri_val
         else:
@@ -1484,7 +1504,7 @@ def main() -> None:
         sub_users = pl.read_csv(SAMPLE_SUBMIT)["user_id"].to_numpy()
         rows_test = np.clip(np.searchsorted(users, sub_users), 0, len(users) - 1)
         pri_test = cohort_prior(seq, rows_test, TEST_CUTOFF, args.lookback,
-                                first_day, coh_prior)
+                                first_day, coh_prior, args.cohort_slim)
         test_static = (pri_test if test_static is None
                        else np.hstack([test_static, pri_test]))
     make_submission(final, seq, users, first_day, args, mean, std, device, res, coh=coh,
