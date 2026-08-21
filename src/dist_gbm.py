@@ -66,9 +66,9 @@ def aligned(y_log: np.ndarray, p: np.ndarray) -> float:
     return rmse_log(y_log, p - p.mean() + y_log.mean())
 
 
-def fit_reg(Xtr, ytr, Xv, yv, feats, rounds, stop, lr):
+def fit_reg(Xtr, ytr, Xv, yv, feats, rounds, stop, lr, leaves):
     import lightgbm as lgb
-    params = {**LGB_REG, "learning_rate": lr}
+    params = {**LGB_REG, "learning_rate": lr, "num_leaves": leaves}
     dtr = lgb.Dataset(Xtr, label=ytr, feature_name=feats)
     dv = lgb.Dataset(Xv, label=yv, reference=dtr)
     m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dv],
@@ -77,10 +77,10 @@ def fit_reg(Xtr, ytr, Xv, yv, feats, rounds, stop, lr):
     return m.predict(Xv, num_iteration=m.best_iteration), m.best_iteration
 
 
-def fit_bins(Xtr, itr, Xv, iv, centers, feats, rounds, stop, lr):
+def fit_bins(Xtr, itr, Xv, iv, centers, feats, rounds, stop, lr, leaves):
     import lightgbm as lgb
     params = {**LGB_REG, "objective": "multiclass", "metric": "multi_logloss",
-              "num_class": len(centers), "learning_rate": lr}
+              "num_class": len(centers), "learning_rate": lr, "num_leaves": leaves}
     dtr = lgb.Dataset(Xtr, label=itr, feature_name=feats)
     dv = lgb.Dataset(Xv, label=iv, reference=dtr)
     m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dv],
@@ -117,10 +117,15 @@ def main() -> None:
     ap.add_argument("--cutoffs", type=int, default=6)
     ap.add_argument("--val-cutoff", default=None)
     ap.add_argument("--bins", type=int, default=24)
-    ap.add_argument("--rounds", type=int, default=2000)
-    ap.add_argument("--early-stopping", type=int, default=100)
-    ap.add_argument("--lr", type=float, default=0.05,
+    ap.add_argument("--rounds", type=int, default=800)
+    ap.add_argument("--early-stopping", type=int, default=50)
+    ap.add_argument("--lr", type=float, default=0.10,
                     help="одна на обе руки: сравнивается голова, а не темп обучения")
+    ap.add_argument("--leaves", type=int, default=63,
+                    help="тоже одна на обе руки. Мультикласс строит K деревьев "
+                         "на итерацию, поэтому рабочие 127 листьев делают его "
+                         "неподъёмным: 24 бина при 127 листьях идут около семи "
+                         "часов на срез")
     ap.add_argument("--blocks", default=None)
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--name", default="dist_gbm")
@@ -152,10 +157,10 @@ def main() -> None:
 
     print("\n--- контроль: regression на log1p ---")
     p_reg, it_reg = fit_reg(Xtr, ytr_log, Xv, yv_log, feats,
-                            args.rounds, args.early_stopping, args.lr)
+                            args.rounds, args.early_stopping, args.lr, args.leaves)
     print(f"\n--- рука: multiclass по {len(centers)} бинам ---")
     p_bin, it_bin, proba = fit_bins(Xtr, itr, Xv, iv, centers, feats,
-                                    args.rounds, args.early_stopping, args.lr)
+                                    args.rounds, args.early_stopping, args.lr, args.leaves)
 
     print(f"\n{'рука':<12}{'сырой':>10}{'выровн.':>10}{'Gini':>9}"
           f"{'смещение':>11}{'итераций':>10}")
@@ -183,7 +188,7 @@ def main() -> None:
             "best_iter_single": it, "val_cutoff": str(val_cut),
             "train_cutoffs": " ".join(str(c) for c in train_cuts), "stride": 30,
             "note": f"{args.note} [голова бустинга, bins={len(centers)}, "
-                    f"lr={args.lr}, выровненный {a:.5f}]",
+                    f"lr={args.lr}, листьев {args.leaves}, выровненный {a:.5f}]",
         })
     print(f"\nзаписано в {LOG}")
 
