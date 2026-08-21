@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 
 from config import MODELS, SAMPLE_SUBMIT, SUBMISSIONS, TEST_CUTOFF
-from datasets import get_dataset
+from datasets import get_dataset, rank_stamps
 from models import GBM
 from utils import append_csv, git_commit
 
@@ -19,11 +19,18 @@ ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
 
 def build_test_frame(features: list[str], rebuild: bool = False,
                      blocks: list[str] | None = None,
-                     net: bool = False) -> tuple[pl.Series, np.ndarray]:
+                     net: bool = False,
+                     rank_stamps_flag: bool = False) -> tuple[pl.Series, np.ndarray]:
     """net берётся из меты обучения: тестовая выборка должна собираться тем же
     набором признаков, что и обучающая, иначе колонок просто не окажется."""
     users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
     feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks, net=net)
+    if rank_stamps_flag:
+        # Тот же ранг внутри среза, что применялся на обучении. Без этого
+        # модель получила бы на тесте абсолютные величины там, где училась
+        # на рангах, и молча поехала бы — колонки-то на месте.
+        feats = rank_stamps(feats)
+        print("датчики времени заменены рангом внутри тестового среза")
     df = users.join(feats, on="user_id", how="left")
     missing = df[features[0]].null_count()
     if missing:
@@ -84,6 +91,7 @@ def main() -> None:
     # собирался тогда с колонками net_rank/net_centered, которых модель не
     # видела, и падал на выборке признаков.
     user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks,
+                                  rank_stamps_flag=bool(meta.get("rank_stamps")),
                                   net=meta.get("net", False))
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")

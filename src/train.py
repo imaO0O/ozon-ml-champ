@@ -20,7 +20,8 @@ import numpy as np
 import polars as pl
 
 from config import CUTOFF_STRIDE, HORIZON, MODELS, SEED, train_cutoffs
-from datasets import feature_names, features_version, get_dataset, parse_blocks
+from datasets import (feature_names, features_version, get_dataset, parse_blocks,
+                      rank_stamps)
 from metrics import report, rmse_log
 from models import GBM, Ensemble
 from utils import append_csv, git_commit
@@ -29,7 +30,8 @@ from utils import append_csv, git_commit
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
                stride: int | None = None, history: int | None = None, net: bool = False,
-               net_feats: str = "rank_centered", drop_stamps: bool = False):
+               net_feats: str = "rank_centered", drop_stamps: bool = False,
+               rank_stamps_flag: bool = False):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -57,6 +59,12 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history, net=net,
                           net_feats=net_feats)
               for c in train_cuts]
+    if rank_stamps_flag:
+        # Каждый срез ранжируется отдельно: ранг по объединённой выборке вернул
+        # бы ровно ту привязку к дате, ради снятия которой всё и делается.
+        val = rank_stamps(val)
+        trains = [rank_stamps(t) for t in trains]
+        print("датчики времени заменены рангом внутри среза")
     feats = feature_names(val)
     if drop_stamps:
         gone = [f for f in feats if f in DATE_STAMPS]
@@ -179,6 +187,11 @@ def main() -> None:
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
     ap.add_argument("--net", action="store_true",
                     help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
+    ap.add_argument("--rank-stamps", action="store_true",
+                    help="заменить датчики времени процентильным рангом внутри "
+                         "среза. Лучше и сохранения, и удаления на обоих срезах: "
+                         "+0.00107 и +0.00082 против +0.00097 и +0.00029 "
+                         "(src/date_stamp.py)")
     ap.add_argument("--drop-stamps", action="store_true",
                     help="снять признаки, монотонно растущие с датой среза "
                          "(tenure, day_crowd_mean_*, first_ord_ago, active_months). "
@@ -199,7 +212,8 @@ def main() -> None:
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
                                          stride=args.stride, net=parse_net(args.net, args.net_names),
-                                         drop_stamps=args.drop_stamps)
+                                         drop_stamps=args.drop_stamps,
+                                         rank_stamps_flag=args.rank_stamps)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -264,6 +278,7 @@ def main() -> None:
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
         "metrics": res, "seed": SEED, "features_version": features_version(blocks),
         "blocks": blocks or "all", "net": parse_net(args.net, args.net_names),
+        "rank_stamps": args.rank_stamps,
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
 

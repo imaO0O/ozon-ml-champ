@@ -50,6 +50,21 @@ def aligned(y_log: np.ndarray, p: np.ndarray) -> float:
     return rmse_log(y_log, p - p.mean() + y_log.mean())
 
 
+def to_rank(col: np.ndarray) -> np.ndarray:
+    """Процентильный ранг ВНУТРИ среза: та же информация без привязки к дате.
+
+    Удаление датчика теряет и порядок, а он полезен: клиент со стажем 300 дней
+    всё-таки отличается от новичка. Ранг сохраняет порядок и снимает абсолютную
+    шкалу — ровно то, что блок `ranks` делает с денежными величинами. На тесте
+    ранг считается по тестовому срезу, поэтому за обучающий диапазон
+    не выходит по построению.
+    """
+    order = np.argsort(col, kind="stable")
+    r = np.empty(len(col), dtype=np.float32)
+    r[order] = np.arange(1, len(col) + 1, dtype=np.float32) / len(col)
+    return r
+
+
 def fit(Xtr, ytr, Xv, yv, feats, rounds, stop, lr, leaves):
     import lightgbm as lgb
     params = {**LGB_REG, "learning_rate": lr, "num_leaves": leaves}
@@ -113,17 +128,30 @@ def main() -> None:
     p_cut, it_cut = fit(Xtr[:, keep], ytr_log, Xv[:, keep], yv_log, names,
                         args.rounds, args.early_stopping, args.lr, args.leaves)
 
+    print("--- рука: датчики заменены рангом внутри среза ---")
+    Xtr_r, Xv_r = Xtr.copy(), Xv.copy()
+    sizes = [d.height for d in parts]
+    for f in dropped:
+        j = feats.index(f)
+        off = 0
+        for n in sizes:
+            Xtr_r[off:off + n, j] = to_rank(Xtr_r[off:off + n, j])
+            off += n
+        Xv_r[:, j] = to_rank(Xv_r[:, j])
+    p_rk, it_rk = fit(Xtr_r, ytr_log, Xv_r, yv_log, feats,
+                      args.rounds, args.early_stopping, args.lr, args.leaves)
+
     print(f"\n{'рука':<16}{'сырой':>10}{'выровн.':>10}{'Gini':>9}{'итераций':>10}")
     rows = []
     for tag, p, it in (("все признаки", p_all, it_all),
-                       ("без датчиков", p_cut, it_cut)):
+                       ("без датчиков", p_cut, it_cut),
+                       ("датчики рангом", p_rk, it_rk)):
         r, a = rmse_log(yv_log, p), aligned(yv_log, p)
         g = gini_norm(yv, np.expm1(p))
         rows.append((tag, r, a, g, it, p))
         print(f"{tag:<16}{r:>10.5f}{a:>10.5f}{g:>9.4f}{it:>10}")
     print(f"\nбез датчиков к контролю по выровненному: {rows[0][2] - rows[1][2]:+.5f}")
-    print(f"расстояние между руками D = "
-          f"{float(np.mean((rows[0][5] - rows[1][5]) ** 2)):.5f}")
+    print(f"датчики рангом к контролю: {rows[0][2] - rows[2][2]:+.5f}")
 
     for tag, r, a, g, it, p in rows:
         append_csv(LOG, FIELDS, {
@@ -142,7 +170,7 @@ def main() -> None:
 
     if args.save_val_pred:
         ids = dfv["user_id"].to_numpy()
-        for tag, p in (("all", rows[0][5]), ("cut", rows[1][5])):
+        for tag, p in (("all", rows[0][5]), ("cut", rows[1][5]), ("rk", rows[2][5])):
             np.savez_compressed(MODELS / f"{args.name}_{tag}_valpred_{val_cut}.npz",
                                 user_id=ids, pred_log=p, target=yv)
         print("предсказания сохранены")
