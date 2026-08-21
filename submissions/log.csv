@@ -115,3 +115,7 @@ xgb_ins_0821_1516.csv,2026-08-21T15:16:25,0663ee8+dirty,xgb_ins,xgb,0.55,1.68032
 xgb_ins_lvl.csv,2026-08-21T15:16:39,0663ee8+dirty,probe,shift,,,,,9220924,0.0000,,зонд уровня: xgb_ins_0821_1516.csv со сдвигом +0.051 в log1p
 xgb_ins_a.csv,2026-08-21T15:16:50,0663ee8+dirty,probe,scale,,,,,10771445,0.0000,,"зонд размаха: xgb_ins_lvl.csv, alpha=1.059, Var=2.35651"
 xgb_ins_q.csv,2026-08-21T15:16:50,0663ee8+dirty,probe,quad,,,,,9951866,0.0018,1.6517474705155406,"зонд кривизны: xgb_ins_a.csv, gamma=-0.01740, Var(g)=7.84669"
+lgbm_stkrk_0821_1931.csv,2026-08-21T19:31:51,80e3e14+dirty,lgbm_stkrk,lgbm,0.25,1.67689,0.7388,0.5173,8942514,0.0000,,
+stkrk_lvl.csv,2026-08-21T19:32:07,80e3e14+dirty,probe,shift,,,,,9381024,0.0000,,зонд уровня: lgbm_stkrk_0821_1931.csv со сдвигом +0.047 в log1p
+stkrk_a.csv,2026-08-21T19:32:21,80e3e14+dirty,probe,scale,,,,,10980914,0.0000,,"зонд размаха: stkrk_lvl.csv, alpha=1.058, Var=2.35731"
+stkrk_q.csv,2026-08-21T19:32:21,80e3e14+dirty,probe,quad,,,,,10115946,0.0000,,"зонд кривизны: stkrk_a.csv, gamma=-0.01740, Var(g)=8.06883"
