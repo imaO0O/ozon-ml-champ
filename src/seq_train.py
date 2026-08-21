@@ -57,6 +57,7 @@ from features import build_target, scan_log
 # длиннее: 30 дней на четыре ровные недели не делятся, а плодить пятую голову
 # ради двух дней смысла нет.
 AUX_EDGES = [7, 14, 21, HORIZON]
+from binning import bin_index, make_bins
 from metrics import report, rmse_log
 from seq_data import (CHANNELS, RAW_CHANNELS, MEAN_CHANNELS, RANK_CHANNELS, SUM_CHANNELS,
                       day_index, events_window, gather, history_mask, open_seq,
@@ -789,52 +790,6 @@ def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
     n = len(mean)
     xb[:, :, :n] = (xb[:, :, :n] - mean) / std
     return xb
-
-
-def make_bins(train_y: list, n_bins: int):
-    """Границы и центры бинов распределительной головы — по обучающим срезам.
-
-    Нулю отводится ОТДЕЛЬНЫЙ бин, а не крайний квантильный: log1p(0) = 0 ровно,
-    и там сидит 45.9% клиентов. Смешать этот атом с малыми положительными
-    значениями значило бы усреднить его с ними и потерять ровно то, ради чего
-    голова и заводится.
-
-    Остальные K-1 бинов режутся по квантилям положительной части, поэтому
-    наполнены одинаково. Центр каждого — СРЕДНЕЕ log1p внутри него, а не
-    середина отрезка: метрике нужна оценка среднего, а хвост скошен, и середина
-    вносила бы смещение, растущее к правому краю.
-
-    Утечки нет: валидационные таргеты сюда не попадают, границы считаются
-    только по обучающим срезам и дальше применяются как есть.
-    """
-    y = np.concatenate([np.log1p(v) for v in train_y])
-    pos = y[y > 0]
-    if n_bins < 3 or len(pos) < n_bins:
-        raise SystemExit(f"--bins {n_bins}: бинов должно быть не меньше трёх "
-                         f"и не больше числа положительных таргетов")
-    # n_bins-2 внутренних границы делят положительную часть на n_bins-1 бинов;
-    # плюс атом нуля — итого n_bins. Совпавшие границы схлопываются: при тяжёлых
-    # совпадениях значений бинов окажется меньше заказанного, и это правильно —
-    # пустой бин с центром из воздуха хуже, чем честно меньшее число бинов.
-    edges = np.unique(np.quantile(pos, np.linspace(0, 1, n_bins)[1:-1]))
-    idx = bin_index(y, edges)
-    centers = np.zeros(len(edges) + 2, dtype=np.float64)
-    for k in range(1, len(centers)):
-        take = idx == k
-        if not take.any():
-            raise SystemExit(f"--bins {n_bins}: бин {k} пуст — квантили вырождены, "
-                             f"уменьшите число бинов")
-        centers[k] = y[take].mean()
-    if not np.all(np.diff(centers) > 0):
-        raise SystemExit("центры бинов не монотонны — это дефект разбиения, "
-                         "предсказание по ним не имеет смысла")
-    return edges, centers
-
-
-def bin_index(ylog: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Номер бина по таргету в log1p-шкале: 0 — ровно ноль, дальше по границам."""
-    idx = 1 + np.searchsorted(edges, ylog, side="right")
-    return np.where(ylog > 0, idx, 0).astype(np.int64)
 
 
 def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, args,
