@@ -77,13 +77,47 @@ def fit_reg(Xtr, ytr, Xv, yv, feats, rounds, stop, lr, leaves):
     return m.predict(Xv, num_iteration=m.best_iteration), m.best_iteration
 
 
-def fit_bins(Xtr, itr, Xv, iv, centers, feats, rounds, stop, lr, leaves):
+def to_proba(raw, k: int) -> np.ndarray:
+    """Привести выход feval к вероятностям: LightGBM отдаёт их по-разному.
+
+    В зависимости от версии в feval приходит либо матрица (n, K), либо плоский
+    массив длиной n*K с раскладкой по классам, и либо сырые логиты, либо уже
+    softmax. Разбираем по факту, а не по вере в версию: цена ошибки здесь —
+    молча неправильная ранняя остановка, то есть ровно та беда, из-за которой
+    этот код и пишется.
+    """
+    p = np.asarray(raw, dtype=np.float64)
+    if p.ndim == 1:
+        p = p.reshape(k, -1).T
+    row = p.sum(axis=1)
+    if np.all(p >= 0) and np.allclose(row, 1.0, atol=1e-6):
+        return p
+    e = np.exp(p - p.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def fit_bins(Xtr, itr, Xv, iv, centers, feats, rounds, stop, lr, leaves, yv_log):
+    """Мультикласс по бинам с ранней остановкой ПО МЕТРИКЕ СОРЕВНОВАНИЯ.
+
+    Умолчание multi_logloss останавливало бы обучение по правдоподобию
+    распределения, а нам нужно среднее этого распределения. Величины разные:
+    на декабре по logloss рука вставала на 36-й итерации против 62 у контроля,
+    и сравнение превращалось в сравнение длительности обучения — ровно та
+    ошибка, которая однажды уже стоила команде ложного вывода про две головы.
+    """
     import lightgbm as lgb
-    params = {**LGB_REG, "objective": "multiclass", "metric": "multi_logloss",
-              "num_class": len(centers), "learning_rate": lr, "num_leaves": leaves}
+    k = len(centers)
+
+    def rmsle_mean(raw, _data):
+        mean = to_proba(raw, k) @ centers
+        return "rmsle_mean", float(np.sqrt(np.mean((mean - yv_log) ** 2))), False
+
+    params = {**LGB_REG, "objective": "multiclass", "metric": "None",
+              "num_class": k, "learning_rate": lr, "num_leaves": leaves}
     dtr = lgb.Dataset(Xtr, label=itr, feature_name=feats)
     dv = lgb.Dataset(Xv, label=iv, reference=dtr)
     m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dv],
+                  feval=rmsle_mean,
                   callbacks=[lgb.early_stopping(stop, verbose=False),
                              lgb.log_evaluation(50)])
     proba = m.predict(Xv, num_iteration=m.best_iteration)
@@ -159,8 +193,8 @@ def main() -> None:
     p_reg, it_reg = fit_reg(Xtr, ytr_log, Xv, yv_log, feats,
                             args.rounds, args.early_stopping, args.lr, args.leaves)
     print(f"\n--- рука: multiclass по {len(centers)} бинам ---")
-    p_bin, it_bin, proba = fit_bins(Xtr, itr, Xv, iv, centers, feats,
-                                    args.rounds, args.early_stopping, args.lr, args.leaves)
+    p_bin, it_bin, proba = fit_bins(Xtr, itr, Xv, iv, centers, feats, args.rounds,
+                                    args.early_stopping, args.lr, args.leaves, yv_log)
 
     print(f"\n{'рука':<12}{'сырой':>10}{'выровн.':>10}{'Gini':>9}"
           f"{'смещение':>11}{'итераций':>10}")
