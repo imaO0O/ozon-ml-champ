@@ -111,3 +111,7 @@ stk2_lvl.csv,2026-08-21T13:20:58,8c4c2d5+dirty,probe,shift,,,,,9424400,0.0000,1.
 probe_stk2_a102.csv,2026-08-21T13:20:58,8c4c2d5+dirty,probe,scale,,,,,9938445,0.0000,1.6512733449316148,"зонд размаха: stk2_lvl.csv, alpha=1.020, Var=2.39267"
 stk2_a.csv,2026-08-21T13:27:06,157ecce+dirty,probe,scale,,,,,10798303,0.0000,,"зонд размаха: stk2_lvl.csv, alpha=1.051, Var=2.39267"
 stk2_q.csv,2026-08-21T13:27:06,157ecce+dirty,probe,quad,,,,,9975050,0.0000,,"зонд кривизны: stk2_a.csv, gamma=-0.01740, Var(g)=7.84026"
+xgb_ins_0821_1516.csv,2026-08-21T15:16:25,0663ee8+dirty,xgb_ins,xgb,0.55,1.68032,0.7377,0.5138,8748128,0.0000,,
+xgb_ins_lvl.csv,2026-08-21T15:16:39,0663ee8+dirty,probe,shift,,,,,9220924,0.0000,,зонд уровня: xgb_ins_0821_1516.csv со сдвигом +0.051 в log1p
+xgb_ins_a.csv,2026-08-21T15:16:50,0663ee8+dirty,probe,scale,,,,,10771445,0.0000,,"зонд размаха: xgb_ins_lvl.csv, alpha=1.059, Var=2.35651"
+xgb_ins_q.csv,2026-08-21T15:16:50,0663ee8+dirty,probe,quad,,,,,9951866,0.0018,,"зонд кривизны: xgb_ins_a.csv, gamma=-0.01740, Var(g)=7.84669"
