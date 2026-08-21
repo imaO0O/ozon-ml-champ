@@ -75,7 +75,7 @@ python -m venv .venv && source .venv/bin/activate && pip install -r requirements
 
 ```bash
 python -u src/datasets.py --test                                  # признаки по всем срезам (кэш в data/processed)
-python -u src/train.py --cutoffs 6 --ensemble --rank-stamps --final --name lgbm_ens
+python -u src/train.py --cutoffs 6 --ensemble --final --name lgbm_ens
 python -u src/predict.py --name lgbm_ens                          # сырой сабмит в submissions/
 python -u src/probe_shift.py --derive-shift --source <сырой>.csv  # сдвиг: бесплатно, без сабмита
 python -u src/probe_shift.py --source <сырой>.csv --delta <выведенный> --out shifted.csv
@@ -102,13 +102,17 @@ python -u src/train.py --cutoffs 6 --blocks windows,lifetime,ratios,platform,uni
 python -u src/train.py --cutoffs 8 --val-cutoff 2025-12-16 --train-cutoffs 2025-06-19,2025-07-19,2025-08-18
 ```
 
-**Флаг `--rank-stamps` включать всегда.** Шесть признаков (`tenure`,
+**Флаг `--rank-stamps` по умолчанию НЕ включать.** Шесть признаков (`tenure`,
 `first_ord_ago`, `active_months`, `day_crowd_mean_30/90/365`) монотонно растут
 с датой среза и на тесте выходят за обучающий диапазон, а деревья за границу
-не экстраполируют: у 75.5% валидационных клиентов `tenure` уже за максимумом
-обучения. Флаг заменяет их процентильным рангом внутри среза — порядок
-сохраняется, привязка к дате уходит. Дало +0.00036 и +0.00077 на рабочем
-стекинге; `predict.py` применяет то же преобразование сам, по флагу из меты.
+не экстраполируют. Замена их процентильным рангом внутри среза выигрывала
++0.00036 и +0.00077 на выровненной валидации — **и проиграла 0.00079
+на лидерборде** (1.6507540 против 1.6499646 у той же модели без замены).
+
+Флаг оставлен рабочим как воспроизводимый отрицательный результат и как
+предупреждение: это единственный известный нам случай, когда эффект прошёл
+приёмку по знаку на обоих срезах и всё равно развернулся на public. Разбор —
+PLAN.md, раздел 4.
 
 Сейчас существуют шесть блоков: `windows`, `lifetime`, `ratios`, `platform`,
 `unit`, `ranks`. Полный список всегда виден в подсказке
