@@ -790,6 +790,39 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
     return out
 
 
+def evaluate_proba(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
+                   bin_days: int = 1, static=None, events: int = 0,
+                   norm: bool = False, no_ranks: bool = False) -> np.ndarray:
+    """Само распределение по бинам, а не только его среднее.
+
+    Нужно для вероятностной части: `P(y = 0)` — это вероятность нулевого бина,
+    квантили берутся по накопленной сумме, CRPS считается прямо по столбцам.
+    В обычном пути распределение выбрасывается сразу после свёртки в среднее,
+    потому что метрике нужно только оно.
+
+    Softmax в float32: в bf16 у 64 бинов не хватает мантиссы, и вероятности
+    дрожат в четвёртом знаке — для RMSLE это безразлично, для диаграммы
+    надёжности нет.
+    """
+    if not getattr(model, "n_bins", 0):
+        raise SystemExit("распределение есть только у сети с --bins")
+    model.eval()
+    out = np.empty((len(rows), model.n_bins), dtype=np.float32)
+    prog = bar(-(-len(rows) // batch_size), "распределение")
+    with torch.no_grad():
+        for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
+                                        bin_days=bin_days, static=static, events=events,
+                                        norm=norm, no_ranks=no_ranks):
+            xb = to_device(x, mean, std, device)
+            sb = None if s is None else torch.from_numpy(s).float().to(device)
+            with autocast(device):
+                p = model(xb, sb)
+            out[take] = torch.softmax(p[:, :model.n_bins].float(), dim=1).cpu().numpy()
+            prog.update(1)
+    prog.close()
+    return out
+
+
 def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
                    bin_days: int = 1, static=None, events: int = 0,
                    norm: bool = False, no_ranks: bool = False) -> np.ndarray:
@@ -1232,6 +1265,10 @@ def main() -> None:
                          "строго беднее: всё, что не легло на эту ось, теряется")
     ap.add_argument("--save-val-pred", action="store_true",
                     help="сохранить предсказания на валидации для бленда с бустингом")
+    ap.add_argument("--save-val-proba", action="store_true",
+                    help="сохранить распределение по бинам, а не только среднее. "
+                         "Нужно для вероятностной части материалов жюри: P(y=0), "
+                         "квантили, покрытие интервалов, CRPS. Требует --bins")
     args = ap.parse_args()
 
     global _AMP
@@ -1413,6 +1450,16 @@ def main() -> None:
         np.savez(MODELS / f"{args.name}_valpred_{val_cut}.npz",
                  user_id=users[val_rows], pred_log=p_log, target=val_y)
         print(f"предсказания валидации: {MODELS / f'{args.name}_valpred_{val_cut}.npz'}")
+
+    if args.save_val_proba:
+        proba = evaluate_proba(model, seq, val_rows, val_cut, args.lookback,
+                               args.batch_size, mean, std, device,
+                               **win_kw(args), static=val_static)
+        np.savez_compressed(MODELS / f"{args.name}_proba_{val_cut}.npz",
+                            user_id=users[val_rows], proba=proba,
+                            centers=model.centers.cpu().numpy(), target=val_y)
+        print(f"распределение по бинам: "
+              f"{MODELS / f'{args.name}_proba_{val_cut}.npz'}")
 
     if args.save_hidden:
         z = extract_hidden(model, seq, val_rows, val_cut, args.lookback, args.batch_size,
