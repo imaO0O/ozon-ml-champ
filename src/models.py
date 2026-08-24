@@ -26,6 +26,28 @@ LGB_REG = dict(
 LGB_BIN = {**LGB_REG, "objective": "binary", "metric": "auc"}
 
 
+def aligned_rmsle(preds, data):
+    """Ранняя остановка по ВЫРОВНЕННОМУ RMSLE — той величине, что решает у нас.
+
+    Умолчание `rmse` считает ошибку вместе с уровнем предсказаний. Но уровень
+    на сабмите правится бесплатным сдвигом из TEST_LEVEL, поэтому в зачёт идёт
+    только форма. С ростом итераций уровень уезжает, сырая метрика перестаёт
+    улучшаться и обрывает обучение — а форма продолжает улучшаться, и после
+    выравнивания это видно:
+
+        срез        оптимум по сырому   оптимум по выровненному   цена
+        2026-01-15        128                    ~200            +0.00072
+        2025-12-16        128                     260            +0.00095
+
+    То есть ловушка уровня, которая четырежды искажала наши ВЫВОДЫ, сидела
+    ещё и внутри самого обучения, и обрывала его вдвое раньше нужного.
+    """
+    y = data.get_label()
+    p = np.asarray(preds, dtype=np.float64)
+    p = p - p.mean() + y.mean()
+    return "rmsle_aligned", float(np.sqrt(np.mean((p - y) ** 2))), False
+
+
 class Ensemble:
     """Среднее нескольких моделей в log1p-шкале — там же, где живёт метрика.
 
@@ -72,6 +94,11 @@ class GBM:
         self.n_estimators, self.early_stopping = n_estimators, early_stopping
         self.log_period = log_period  # 0 — молча, нужно при переборе гиперпараметров
         self.params = dict(params or {})
+        # Остановка по выровненному RMSLE вместо сырого. Умолчание True:
+        # выровненная величина — единственная, по которой мы вообще сравниваем
+        # модели (PLAN.md, раздел 2), и останавливаться по другой значит
+        # обрывать обучение по чужому критерию.
+        self.align_stop = bool(self.params.pop("align_stop", True))
         self.model = None
         self.best_iter = n_estimators
 
@@ -101,8 +128,13 @@ class GBM:
                 valid = [lgb.Dataset(X_val, label=y_val, init_score=init_score_val,
                                      reference=dtrain)]
                 cbs.append(lgb.early_stopping(self.early_stopping, verbose=False))
+            feval = None
+            if has_val and self.align_stop:
+                # Остановка по выровненному RMSLE: см. aligned_rmsle выше.
+                base = {**base, "metric": "None"}
+                feval = aligned_rmsle
             self.model = lgb.train(base, dtrain, num_boost_round=self.n_estimators,
-                                   valid_sets=valid, callbacks=cbs)
+                                   valid_sets=valid, feval=feval, callbacks=cbs)
             self.best_iter = self.model.best_iteration or self.n_estimators
 
         elif self.kind == "cat":

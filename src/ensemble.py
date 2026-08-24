@@ -62,7 +62,44 @@ CAT_MEMBERS = [
 # но величина втрое ниже порога различимости (0.002), поэтому в рабочий путь
 # не берём. Состав mixed оставлен проверенным — он пригодится как заведомо
 # непохожая вторая модель при выборе двух финальных решений.
+# Состав по итогам перебора 40 конфигураций на АКТУАЛЬНОЙ модели — с блоком
+# ranks и с признаком сети (models/tuning.csv, 22.08). Прежний состав LGB_MEMBERS
+# подбирался, когда признаков было 161 и стекинга не существовало: тогда глубокие
+# деревья добирали взаимодействия сами. Свежий перебор говорит обратное — вся
+# верхушка это 31-63 листа, а 255 листьев стабильно внизу:
+#
+#     лучшие  1.66953 ... 1.66992   листьев 31-63
+#     худшие  1.67107 ... 1.67118   листьев 255
+#
+# Участники подобраны не по одному только качеству, а по РАЗЛИЧИЮ: темп от 0.01
+# до 0.03, доля признаков от 0.5 до 0.8, подвыборка от 0.7 до 1.0, регуляризация
+# от 1 до 20. Ансамбль усредняет, поэтому от участников нужна непохожесть
+# при сопоставимой силе — то же соотношение, что решает в блендах.
+TUNED_MEMBERS = [
+    ("tuned_l63_lr03_ff05", "lgbm",
+     dict(learning_rate=0.03, num_leaves=63, min_data_in_leaf=500,
+          feature_fraction=0.5, bagging_fraction=0.7, lambda_l2=20.0,
+          max_bin=255, seed=SEED)),
+    ("tuned_l31_lr03_ff08", "lgbm",
+     dict(learning_rate=0.03, num_leaves=31, min_data_in_leaf=100,
+          feature_fraction=0.8, bagging_fraction=1.0, lambda_l2=20.0,
+          max_bin=255, seed=SEED)),
+    ("tuned_l63_lr02_bin127", "lgbm",
+     dict(learning_rate=0.02, num_leaves=63, min_data_in_leaf=1000,
+          feature_fraction=0.8, bagging_fraction=0.7, lambda_l2=1.0,
+          max_bin=127, seed=SEED)),
+    ("tuned_l31_lr03_md1000", "lgbm",
+     dict(learning_rate=0.03, num_leaves=31, min_data_in_leaf=1000,
+          feature_fraction=0.8, bagging_fraction=1.0, lambda_l2=20.0,
+          max_bin=127, seed=7)),
+    ("tuned_l63_lr01_ff05", "lgbm",
+     dict(learning_rate=0.01, num_leaves=63, min_data_in_leaf=1000,
+          feature_fraction=0.5, bagging_fraction=1.0, lambda_l2=1.0,
+          max_bin=127, seed=SEED)),
+]
+
 MEMBER_SETS = {
+    "tuned": TUNED_MEMBERS,
     "lgb": LGB_MEMBERS,
     "cat": CAT_MEMBERS,
     "mixed": LGB_MEMBERS + CAT_MEMBERS,
