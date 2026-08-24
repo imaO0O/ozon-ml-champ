@@ -53,6 +53,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="netoof", help="префикс выходных .npz")
     ap.add_argument("--lookback", type=int, default=90)
+    ap.add_argument("--bin", type=int, default=1,
+                    help="дней в одном шаге последовательности: 1 — по дням, "
+                         "7 — по неделям. Длина окна должна делиться на это число. "
+                         "Годовая сеть (--lookback 364 --bin 7) даёт информацию, "
+                         "которой нет ни у бустинга, ни у дневной сети: у первого "
+                         "есть годовые СУММЫ, у второй форма квартала, а годовой "
+                         "траектории не видит никто")
     ap.add_argument("--arch", default="gru")
     # PowerShell выбрасывает пустую строку из аргументов нативной программы,
     # поэтому «без статических признаков» задаётся словом, а не `--static ""`.
@@ -136,6 +143,8 @@ def main() -> None:
                     cmd += ["--no-day-ranks"]
                 if args.two_head:
                     cmd += ["--two-head", "--buy-weight", str(args.buy_weight)]
+                if args.bin > 1:
+                    cmd += ["--bin", str(args.bin)]
                 if args.bins:
                     cmd += ["--bins", str(args.bins)]
                     if args.bin_mse:
