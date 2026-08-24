@@ -90,14 +90,16 @@ def recency_weights(train: pl.DataFrame, halflife: float) -> np.ndarray | None:
     return (0.5 ** (gap / halflife)).astype(np.float32)
 
 
-def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None):
+def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None,
+               params=None, early_stopping=200):
     """Одна модель или ансамбль разнородных конфигураций (см. ensemble.py).
 
     Ансамбль выигрывает у рабочего умолчания на обоих валидационных срезах,
     тогда как отдельные конфигурации-чемпионы между срезами не переносятся.
     """
     if not members:
-        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
+        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds,
+                params=params, early_stopping=early_stopping)
         m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
         return m
 
@@ -110,13 +112,16 @@ def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, mem
     return Ensemble(models, [n for n, _, _ in members])
 
 
-def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000, w=None):
-    clf = GBM(kind=kind, task="bin", device=device, n_estimators=rounds)
+def fit_two_stage(X, y, Xv, yv, feats, kind, device, rounds=6000, w=None,
+                  params=None, early_stopping=200):
+    clf = GBM(kind=kind, task="bin", device=device, n_estimators=rounds,
+              params=params, early_stopping=early_stopping)
     clf.fit(X, (y > 0).astype(np.int8), Xv, (yv > 0).astype(np.int8),
             feature_names=feats, sample_weight=w)
 
     pos, posv = y > 0, yv > 0
-    reg = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
+    reg = GBM(kind=kind, task="reg", device=device, n_estimators=rounds,
+              params=params, early_stopping=early_stopping)
     reg.fit(X[pos], np.log1p(y[pos]), Xv[posv], np.log1p(yv[posv]),
             feature_names=feats, sample_weight=w[pos] if w is not None else None)
     return clf, reg
@@ -153,6 +158,14 @@ def main() -> None:
                     help="подмножество блоков признаков через запятую (ablation)")
     ap.add_argument("--halflife", type=float, default=0,
                     help="период полураспада веса примера в днях; 0 = все срезы равнозначны")
+    # Перебор гиперпараметров судился по сырой метрике и потому недействителен
+    # (65 прогонов из 71). Эти ключи открывают его заново, не трогая умолчаний.
+    ap.add_argument("--lr", type=float, default=None,
+                    help="скорость обучения; умолчание из models.LGB_REG")
+    ap.add_argument("--leaves", type=int, default=None, help="num_leaves")
+    ap.add_argument("--min-data", type=int, default=None, help="min_data_in_leaf")
+    ap.add_argument("--early-stopping", type=int, default=200,
+                    help="итераций без улучшения до остановки")
     ap.add_argument("--ensemble", action="store_true",
                     help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
     ap.add_argument("--members", default="lgb",
@@ -198,10 +211,17 @@ def main() -> None:
         print(f"одноголовая модель — ансамбль '{args.members}' из {len(members)} конфигураций: "
               + ", ".join(n for n, _, _ in members))
 
+    tune = {k: v for k, v in (("learning_rate", args.lr), ("num_leaves", args.leaves),
+                              ("min_data_in_leaf", args.min_data)) if v is not None}
+    if tune:
+        print(f"гиперпараметры поверх умолчаний: {tune} | "
+              f"остановка {args.early_stopping} итераций")
     single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds,
-                        w=sw, members=members)
+                        w=sw, members=members, params=tune or None,
+                        early_stopping=args.early_stopping)
     p_single = single.predict(Xva)
-    clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds, w=sw)
+    clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds,
+                             w=sw, params=tune or None, early_stopping=args.early_stopping)
     p_two = two_stage_predict(clf, reg, Xva)
 
     print("\n--- валидация (cutoff %s) ---" % cuts[0])
