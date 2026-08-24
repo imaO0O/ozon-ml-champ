@@ -93,7 +93,7 @@ def main() -> None:
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
     print(f"обучение {len(ytr):,} строк | валидация {len(yva):,} | признаков {len(feats)}")
-    print(f"срез валидации {cuts[0]} | конфигураций {len(RATES) * len(SHAPES)}\n")
+
 
     if args.random:
         rng = np.random.default_rng(args.seed)
@@ -101,6 +101,9 @@ def main() -> None:
     else:
         configs = [{"learning_rate": lr, "num_leaves": lv, "min_data_in_leaf": md}
                    for lr, (lv, md) in itertools.product(RATES, SHAPES)]
+    kind = f"случайный поиск, сид {args.seed}" if args.random else "сетка 3x3"
+    print(f"срез валидации {cuts[0]} | {kind} | конфигураций {len(configs)}")
+    print()
 
     rows = []
     best_so_far = float("inf")
