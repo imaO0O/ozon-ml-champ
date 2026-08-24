@@ -40,8 +40,38 @@ from utils import append_csv, git_commit
 RATES = [0.008, 0.015, 0.03]
 SHAPES = [(127, 200), (255, 500), (511, 1000)]
 
+# Пространство случайного поиска. Первые три оси мы уже прошли сеткой и знаем,
+# что там лежит 0.0008. Остальные четыре не трогали НИ РАЗУ — ни мы, ни
+# недействительный перебор трека A, — а именно регуляризация и подвыборки
+# обычно и дают на такой размерности основную часть выигрыша.
+SPACE = {
+    "learning_rate": ("logu", 0.004, 0.04),
+    "num_leaves": ("int", 63, 1023),
+    "min_data_in_leaf": ("int", 50, 2000),
+    "feature_fraction": ("u", 0.4, 1.0),
+    "bagging_fraction": ("u", 0.5, 1.0),
+    "lambda_l2": ("logu", 0.1, 100.0),
+    "min_gain_to_split": ("u", 0.0, 0.5),
+}
+
 FIELDS = ["created", "commit", "val_cutoff", "lr", "leaves", "min_data",
+          "feature_fraction", "bagging_fraction", "lambda_l2", "min_gain",
           "iters", "rmsle_raw", "rmsle_aligned", "gini", "seconds"]
+
+
+def sample_config(rng) -> dict:
+    """Одна точка пространства. Логравномерно там, где важен порядок величины."""
+    out = {}
+    for name, (kind, lo, hi) in SPACE.items():
+        if kind == "logu":
+            out[name] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+        elif kind == "int":
+            out[name] = int(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+        else:
+            out[name] = float(rng.uniform(lo, hi))
+    # bagging_freq обязателен, иначе LightGBM молча игнорирует bagging_fraction.
+    out["bagging_freq"] = 1
+    return out
 
 
 def main() -> None:
@@ -52,6 +82,9 @@ def main() -> None:
     ap.add_argument("--early-stopping", type=int, default=400,
                     help="при малой скорости каждая итерация двигает модель меньше, "
                          "и прежний запас 200 обрывал бы прогон рано")
+    ap.add_argument("--random", type=int, default=0,
+                    help="случайный поиск: сколько точек взять вместо сетки 3x3")
+    ap.add_argument("--seed", type=int, default=0, help="сид случайного поиска")
     args = ap.parse_args()
 
     val_cutoff = dt.date.fromisoformat(args.val_cutoff) if args.val_cutoff else None
@@ -62,13 +95,21 @@ def main() -> None:
     print(f"обучение {len(ytr):,} строк | валидация {len(yva):,} | признаков {len(feats)}")
     print(f"срез валидации {cuts[0]} | конфигураций {len(RATES) * len(SHAPES)}\n")
 
+    if args.random:
+        rng = np.random.default_rng(args.seed)
+        configs = [sample_config(rng) for _ in range(args.random)]
+    else:
+        configs = [{"learning_rate": lr, "num_leaves": lv, "min_data_in_leaf": md}
+                   for lr, (lv, md) in itertools.product(RATES, SHAPES)]
+
     rows = []
-    for i, (lr, (leaves, min_data)) in enumerate(itertools.product(RATES, SHAPES), 1):
+    best_so_far = float("inf")
+    for i, cfg in enumerate(configs, 1):
+        lr = cfg["learning_rate"]
+        leaves, min_data = cfg["num_leaves"], cfg["min_data_in_leaf"]
         t0 = time.time()
         m = GBM(kind="lgbm", task="reg", device="cpu", n_estimators=args.rounds,
-                early_stopping=args.early_stopping, log_period=0,
-                params={"learning_rate": lr, "num_leaves": leaves,
-                        "min_data_in_leaf": min_data})
+                early_stopping=args.early_stopping, log_period=0, params=cfg)
         m.fit(Xtr, ytr_log, Xva, yva_log, feature_names=feats)
         p = m.predict(Xva)
         raw = rmse_log(yva_log, p)
@@ -77,15 +118,24 @@ def main() -> None:
         gini = gini_norm(yva, np.expm1(np.clip(pa, 0, None)))
         secs = time.time() - t0
         rows.append((lr, leaves, min_data, m.best_iter, raw, ali, gini, secs))
-        print(f"[{i}/9] lr {lr:<6} листья {leaves:<4} лист>={min_data:<5} "
-              f"итераций {m.best_iter:<5} сырой {raw:.5f} выровн. {ali:.5f} "
-              f"Gini {gini:.4f} | {secs:.0f}s")
+        mark = ""
+        if ali < best_so_far:
+            best_so_far, mark = ali, "  <- лучшая"
+        print(f"[{i}/{len(configs)}] lr {lr:.4f} листья {leaves:<4} лист>={min_data:<5} "
+              f"ff {cfg.get('feature_fraction', 1):.2f} bag {cfg.get('bagging_fraction', 1):.2f} "
+              f"l2 {cfg.get('lambda_l2', 0):.2f} | итер {m.best_iter:<5} "
+              f"выровн. {ali:.5f} Gini {gini:.4f} | {secs:.0f}s{mark}", flush=True)
         append_csv(MODELS / "lgb_grid.csv", FIELDS, {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
-            "commit": git_commit(), "val_cutoff": str(cuts[0]), "lr": lr,
-            "leaves": leaves, "min_data": min_data, "iters": m.best_iter,
-            "rmsle_raw": round(raw, 5), "rmsle_aligned": round(ali, 5),
-            "gini": round(gini, 4), "seconds": round(secs)})
+            "commit": git_commit(), "val_cutoff": str(cuts[0]),
+            "lr": round(lr, 5), "leaves": leaves, "min_data": min_data,
+            "feature_fraction": round(cfg.get("feature_fraction", 1.0), 3),
+            "bagging_fraction": round(cfg.get("bagging_fraction", 1.0), 3),
+            "lambda_l2": round(cfg.get("lambda_l2", 0.0), 3),
+            "min_gain": round(cfg.get("min_gain_to_split", 0.0), 3),
+            "iters": m.best_iter, "rmsle_raw": round(raw, 5),
+            "rmsle_aligned": round(ali, 5), "gini": round(gini, 4),
+            "seconds": round(secs)})
 
     print(f"\n{'по выровненной метрике':<24}{'lr':>7}{'листья':>8}{'лист>=':>8}"
           f"{'итер':>7}{'выровн.':>10}{'сырой':>10}{'Gini':>8}")
