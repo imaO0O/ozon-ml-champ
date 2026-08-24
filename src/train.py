@@ -23,7 +23,7 @@ from config import CUTOFF_STRIDE, HORIZON, MODELS, SEED, train_cutoffs
 from datasets import (feature_names, features_version, get_dataset, parse_blocks,
                       rank_stamps)
 from metrics import report, rmse_log
-from models import GBM, Ensemble
+from models import GBM, LGB_SINGLE_TUNED, Ensemble
 from utils import append_csv, git_commit
 
 
@@ -118,14 +118,19 @@ def recency_weights(train: pl.DataFrame, halflife: float) -> np.ndarray | None:
     return (0.5 ** (gap / halflife)).astype(np.float32)
 
 
-def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None):
+def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None,
+               tuned=True):
     """Одна модель или ансамбль разнородных конфигураций (см. ensemble.py).
 
     Ансамбль выигрывает у рабочего умолчания на обоих валидационных срезах,
     тогда как отдельные конфигурации-чемпионы между срезами не переносятся.
     """
     if not members:
-        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
+        # Настроенные параметры получает ТОЛЬКО одиночная рука. Двухэтапная
+        # модель остаётся на умолчаниях: она здесь партнёр по бленду, и
+        # сближать её с одиночной невыгодно (см. LGB_SINGLE_TUNED).
+        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds,
+                params=LGB_SINGLE_TUNED if (tuned and kind == "lgbm") else None)
         m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
         return m
 
@@ -199,6 +204,10 @@ def main() -> None:
                          "за него не экстраполируют — см. DATE_STAMPS")
     ap.add_argument("--net-names", default=None,
                     help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
+    ap.add_argument("--plain-single", action="store_true",
+                    help="одиночная рука на умолчаниях конвейера, без настроенных "
+                         "параметров LGB_SINGLE_TUNED — нужен для контрольных прогонов, "
+                         "чтобы не править код ради сравнения")
     ap.add_argument("--save-val-pred", action="store_true",
                     help="сохранить предсказания на валидации в models/<имя>_valpred_<срез>.npz "
                          "(user_id, pred_log, target) — для обмена с другими треками")
@@ -239,7 +248,7 @@ def main() -> None:
               + ", ".join(n for n, _, _ in members))
 
     single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds,
-                        w=sw, members=members)
+                        w=sw, members=members, tuned=not args.plain_single)
     p_single = single.predict(Xva)
     clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds, w=sw)
     p_two = two_stage_predict(clf, reg, Xva)
@@ -335,7 +344,10 @@ def main() -> None:
             f_single = Ensemble(fitted, [n for n, _, _ in members])
         else:
             f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale),
-                           early_stopping=0)
+                           early_stopping=0,
+                           params=(LGB_SINGLE_TUNED
+                                   if (not args.plain_single and args.model == "lgbm")
+                                   else None))
             f_single.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
         f_clf = GBM(args.model, "bin", args.device, int(clf.best_iter * scale), early_stopping=0)
         f_clf.fit(Xall, (yall > 0).astype(np.int8), feature_names=feats, sample_weight=sw_all)
