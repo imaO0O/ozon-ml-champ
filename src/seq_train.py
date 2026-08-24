@@ -1346,6 +1346,7 @@ def main() -> None:
     print()
     print(f"--- финальное обучение на всех {len(train_cuts) + 1} срезах, "
           f"{n_final} эпох (горизонт как на валидации; лучшая была {best_epoch}) ---")
+    all_cuts = [*train_cuts, val_cut]
     all_rows = [*train_rows, val_rows]
     all_y = [*train_y, val_y]
     all_base = None if train_base is None else [*train_base, val_base]
