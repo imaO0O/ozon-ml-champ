@@ -867,13 +867,26 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                          **win_kw(args), static=val_static)
             if val_base is not None:
                 p = val_base + p          # метрика считается по полному предсказанию
-            score = rmse_log(np.log1p(val_y), p)
+            # Ранняя остановка судит по ВЫРОВНЕННОЙ метрике, а не по сырой.
+            #
+            # В сырой RMSLE входит промах по уровню, а на сабмите уровень
+            # правится бесплатно выведенным сдвигом и в зачёт не идёт. Судя по
+            # сырой величине, остановка выбирала эпоху, где сети «повезло с
+            # уровнем», а не где она лучше по существу. У сети это особенно
+            # больно: её промах по уровню +0.101 против +0.050 у бустинга.
+            #
+            # Та же ловушка уровня, что мы ловили в сравнениях моделей, только
+            # спрятанная внутрь цикла обучения — там её никто не искал год.
+            yv = np.log1p(val_y)
+            score = rmse_log(yv, p - p.mean() + yv.mean())
             history.append(score)
             mark = ""
             if score < best[0]:
                 best = (score, {k: v.detach().clone() for k, v in model.state_dict().items()}, epoch)
                 mark = "  <- лучшая"
-            print(f"{line} | val RMSLE {score:.5f} | {time.time() - t0:.0f}s{mark}")
+            # Подпись «выр.» обязательна: итоговый блок печатает СЫРУЮ метрику,
+            # и без пометки два числа в одном логе выглядели бы расхождением.
+            print(f"{line} | val RMSLE выр. {score:.5f} | {time.time() - t0:.0f}s{mark}")
             if epoch - best[2] >= args.patience:
                 print(f"ранняя остановка: {args.patience} эпох без улучшения")
                 break
