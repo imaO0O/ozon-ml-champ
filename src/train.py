@@ -170,7 +170,21 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lgbm", choices=["lgbm", "cat", "xgb"])
     ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
-    ap.add_argument("--cutoffs", type=int, default=6)
+    # Девять обучающих срезов, а не пять. Замер 24.08 на починенном смесителе,
+    # обе руки одним протоколом:
+    #
+    #     глубина     строк      январь     декабрь
+    #     5 срезов   1205328    1.66911    1.73607
+    #     7 срезов   1659719    1.66898    1.73566
+    #     9 срезов   2097330    1.66895    1.73559
+    #                           +0.00016   +0.00048
+    #
+    # Знак сходится на обоих срезах. Глубже не идём: кривая насыщается (7 -> 9
+    # дал вшестеро меньше, чем 5 -> 7), а данные начинаются 01.01.2025, и на
+    # двенадцати срезах у самого старого осталось бы двадцать дней истории.
+    ap.add_argument("--cutoffs", type=int, default=10,
+                    help="сколько срезов брать всего; первый идёт на валидацию, "
+                         "остальные в обучение")
     ap.add_argument("--rounds", type=int, default=6000)
     ap.add_argument("--rebuild", action="store_true", help="пересобрать признаки, игнорируя кэш")
     ap.add_argument("--name", default=None, help="имя артефактов (по умолчанию = --model)")
