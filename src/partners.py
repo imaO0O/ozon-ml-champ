@@ -4,7 +4,7 @@ sys.path.insert(0, "src")
 import numpy as np, polars as pl
 from config import SAMPLE_SUBMIT, SUBMISSIONS
 
-REC = "mix_c2.csv"
+REC = "mix_stk.csv"
 solved = {"gru_dr90_avg3.csv": 1.6515714, "stack_dr_sh_sh.csv": 1.6527429}
 
 scores = {}
