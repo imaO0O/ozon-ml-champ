@@ -258,9 +258,21 @@ def main() -> None:
     res["single"] = report(yva, np.expm1(p_single), "single")
     res["two_stage"] = report(yva, np.expm1(p_two), "two-stage")
 
+    # Вес выбирается по ВЫРОВНЕННОМУ RMSLE. Сырая величина включает уровень,
+    # а он на сабмите правится бесплатным сдвигом из TEST_LEVEL и в зачёт
+    # не идёт. У одиночной и двухэтапной руки уровни РАЗНЫЕ, поэтому смесь
+    # меняет и форму, и уровень; выбирая по сырому, смеситель чинит уровень
+    # за счёт формы и останавливается не на том весе.
+    #
+    # Это тот же дефект, что был у ранней остановки (см. models.aligned_rmsle),
+    # только в другом месте, и он задел все прогоны train.py до 24.08.
+    # Обнаружен по невозможному признаку: у руки с лучшей одиночной моделью
+    # смеситель выставил w=1.00, то есть выкинул двухэтапную руку целиком,
+    # хотя обе руки были те же, что в контроле.
     best_w, best_rmse = 0.0, float("inf")
     for w in np.linspace(0, 1, 21):
-        r = rmse_log(yva_log, w * p_two + (1 - w) * p_single)
+        p = w * p_two + (1 - w) * p_single
+        r = rmse_log(yva_log, p - p.mean() + yva_log.mean())
         if r < best_rmse:
             best_w, best_rmse = float(w), r
     p_blend = best_w * p_two + (1 - best_w) * p_single
