@@ -144,7 +144,7 @@ from . import ranks  # noqa: E402,F401  (последним: ранжирует 
 # от которых мы отказались. Но и удалять их незачем — они ценны как
 # задокументированный отрицательный результат, и перепроверить должно быть
 # дёшево. Поэтому подключаются по явному запросу: --blocks shape.
-OPTIONAL_BLOCKS = {"shape"}
+OPTIONAL_BLOCKS = {"shape", "burst"}
 
 
 def enable_optional(blocks: "list[str] | None") -> None:
