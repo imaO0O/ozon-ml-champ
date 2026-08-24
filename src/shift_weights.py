@@ -35,7 +35,7 @@ import numpy as np
 from config import MODELS, SEED, train_cutoffs
 from datasets import feature_names, features_version, get_dataset, parse_blocks
 from metrics import gini_norm, rmse_log
-from models import LGB_REG
+from models import LGB_REG, aligned_rmsle
 from utils import append_csv, git_commit
 
 LOG = MODELS / "experiments.csv"
@@ -83,10 +83,16 @@ def discriminator(Xtr, Xv, feats, rounds, lr):
 
 def fit_reg(Xtr, ytr, Xv, yv, feats, rounds, stop, lr, leaves, weight=None):
     import lightgbm as lgb
-    params = {**LGB_REG, "learning_rate": lr, "num_leaves": leaves}
+    # Остановка по ВЫРОВНЕННОМУ RMSLE: сырая величина включает уровень,
+    # который на сабмите правится бесплатно, и обрывает обучение вдвое раньше
+    # нужного (PLAN.md, раздел 4а). Все замеры этого файла до 22.08 делались
+    # на недообученных руках — сравнение было честным, но точка не та.
+    params = {**LGB_REG, "learning_rate": lr, "num_leaves": leaves,
+              "metric": "None"}
     dtr = lgb.Dataset(Xtr, label=ytr, weight=weight, feature_name=feats)
     dv = lgb.Dataset(Xv, label=yv, reference=dtr)
     m = lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dv],
+                  feval=aligned_rmsle,
                   callbacks=[lgb.early_stopping(stop, verbose=False),
                              lgb.log_evaluation(200)])
     return m.predict(Xv, num_iteration=m.best_iteration), m.best_iteration
