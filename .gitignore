@@ -21,3 +21,6 @@ catboost_info/
 .ipynb_checkpoints/
 .idea/
 .vscode/
+
+# файлы передачи между треками — уходят напрямую, не через git
+handoff_*.npz
