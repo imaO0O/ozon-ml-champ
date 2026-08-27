@@ -945,6 +945,10 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     # неполный батч есть у каждого, и общая сумма больше, чем total/batch_size.
     steps = max(1, sum(-(-len(r) // args.batch_size) for r in train_rows))
     n_epochs = epochs or args.epochs
+    # Скользящая оценка смещения уровня для --free-level. Хранится как
+    # обычный тензор без градиента: она не параметр модели, а поправка,
+    # выводимая из данных, и учить её не нужно.
+    lvl_off = torch.zeros((), device=device)
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=args.lr, total_steps=steps * n_epochs, pct_start=0.15)
     rng = np.random.default_rng(args.seed)
@@ -989,8 +993,15 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                         # кросс-энтропию, и это умолчание — чтобы первый замер
                         # проверял ровно одну вещь.
                         if args.bin_mse:
-                            loss = loss + args.bin_mse * nn.functional.mse_loss(
-                                mean_p, tb)
+                            if args.free_level:
+                                with torch.no_grad():
+                                    d = mean_p.mean() - tb.mean()
+                                    lvl_off.mul_(0.99).add_(0.01 * d)
+                                loss = loss + args.bin_mse * nn.functional.mse_loss(
+                                    mean_p - lvl_off, tb)
+                            else:
+                                loss = loss + args.bin_mse * nn.functional.mse_loss(
+                                    mean_p, tb)
                     elif model.two_head:
                         # Условная голова учится ТОЛЬКО на покупателях: у
                         # остальных условной величины не существует, и подача
@@ -1006,8 +1017,23 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
                         main = float(nn.functional.mse_loss(
                             head_predict(model, p).detach(), tb))
                     else:
-                        loss = nn.functional.mse_loss(p[:, 0], tb)
-                        main = float(loss)
+                        if args.free_level:
+                            # Обновляем оценку смещения уровня и вычитаем её.
+                            # Тогда средний градиент по уровню равен нулю:
+                            # модель перестаёт тратить ёмкость на сдвиг,
+                            # который на сабмите правится бесплатно.
+                            with torch.no_grad():
+                                d = p[:, 0].mean() - tb.mean()
+                                lvl_off.mul_(0.99).add_(0.01 * d)
+                            loss = nn.functional.mse_loss(p[:, 0] - lvl_off, tb)
+                            # В отчётный RMSE идёт НЕскорректированное
+                            # предсказание: иначе числа несравнимы с прежними
+                            # прогонами, а сравнивать всё равно надо
+                            # по выровненной величине.
+                            main = float(nn.functional.mse_loss(p[:, 0].detach(), tb))
+                        else:
+                            loss = nn.functional.mse_loss(p[:, 0], tb)
+                            main = float(loss)
                     if ab is not None:
                         # Вспомогательные головы влияют только на градиент:
                         # в отчётный RMSE идёт основная, иначе числа стали бы
@@ -1125,6 +1151,12 @@ def make_submission(model, seq, users, first_day, args, mean, std, device, meta:
         print(f"  наивный темп добавляется обратно: mean base {base.mean():.4f}, "
               f"mean остатка {p_log.mean():+.4f}")
         p_log = p_log + base
+    if args.free_level and args.bins and not args.bin_mse:
+        raise SystemExit(
+            "--free-level с чистой распределительной головой не делает ничего: "
+            "кросс-энтропия по бинам не имеет отдельной степени свободы уровня, "
+            "её задаёт само распределение. Возьмите либо --bins без --free-level, "
+            "либо --free-level с --bin-mse > 0, либо обычную голову без --bins.")
     if args.residual:
         # Тот же объект, что и в обучении: бустинг, обученный на всех срезах.
         base = load_base(args.residual, "test", users, rows)
@@ -1177,7 +1209,7 @@ def main() -> None:
                     help="иерархия: сетка NxN по стажу и активности, и распределение "
                          "по бинам ВНУТРИ когорты подаётся входом. Не путать "
                          "с --cohort-base: там когортное среднее вычиталось из цели "
-                         "и ломалось о 46% нулей, здесь цель не трогается вовсе. "
+                         "и ломалось о 46%% нулей, здесь цель не трогается вовсе. "
                          "Требует --bins")
     ap.add_argument("--cohort-slim", action="store_true",
                     help="от когортного приора оставить две колонки вместо K: "
@@ -1303,6 +1335,17 @@ def main() -> None:
                          "(например rk_ — процентильные ранги из блока ranks). "
                          "Для сети это первая нормировка входа, устойчивая к сдвигу "
                          "уровня площадки; нужен кэш признаков из datasets.py")
+    ap.add_argument("--free-level", action="store_true",
+                    help="учить величину, ИНВАРИАНТНУЮ К УРОВНЮ: уровень предсказаний "
+                         "правится на сабмите бесплатным сдвигом из TEST_LEVEL и в зачёт "
+                         "не идёт, поэтому обычная L2 тратит ёмкость на степень свободы, "
+                         "которая не считается. Замер мотива: разброс УРОВНЯ между сидами "
+                         "у финальных сетей 0.156 (2.319 … 2.475) при разбросе ФОРМЫ 0.0008 "
+                         "— в двести раз больше на величину, которая обнуляется. "
+                         "Реализация: из предсказания вычитается скользящая оценка "
+                         "смещения уровня, и градиент по уровню обнуляется. Центрировать "
+                         "по батчу нельзя: среднее 512 значений log1p имеет разброс 0.10, "
+                         "и этот шум попал бы прямо в потери.")
     ap.add_argument("--residual", default=None,
                     help="учить остаток бустинга: имя набора из seq_oof.py (например oof). "
                          "Выход сети по построению ортогонален тому, что бустинг уже умеет")
