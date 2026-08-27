@@ -9,7 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
-from config import DATA_PROC, TEST_CUTOFF, TRAIN_PARQUET, train_cutoffs
+from config import DATA_PROC, HORIZON, TEST_CUTOFF, TRAIN_PARQUET, train_cutoffs
 from features import BLOCKS, build_dataset
 
 ID = "user_id"
@@ -38,10 +38,15 @@ def features_version(blocks: list[str] | None = None) -> str:
 
 
 def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int | None = None,
-                 net: bool = False, net_feats: str = "rank_centered"):
+                 net: bool = False, net_feats: str = "rank_centered",
+                 horizon: int | None = None):
     # В имени — источник данных (синтетика/реальные), версия кода признаков,
     # глубина обрезки истории и наличие признаков сети: это разные выборки.
     tail = f"_h{history}" if history else ""
+    # Горизонт таргета — часть ключа: выборка с 15-дневным таргетом и с
+    # 30-дневным различаются только колонкой target, и перепутать их нельзя.
+    if horizon and horizon != HORIZON:
+        tail += f"_hz{horizon}"
     if net:
         # Имена сетей входят в ключ: выборка с одной сетью и с тремя — разные.
         tail += "_net" if net is True else "_net-" + "-".join(net)
@@ -54,11 +59,16 @@ def dataset_path(cutoff: dt.date, blocks: list[str] | None = None, history: int 
 
 def get_dataset(cutoff: dt.date, with_target: bool = True, rebuild: bool = False,
                 blocks: list[str] | None = None, history: int | None = None,
-                net: bool = False, net_feats: str = "rank_centered") -> pl.DataFrame:
-    path = dataset_path(cutoff, blocks, history, net, net_feats)
+                net: bool = False, net_feats: str = "rank_centered",
+                horizon: int | None = None) -> pl.DataFrame:
+    path = dataset_path(cutoff, blocks, history, net, net_feats, horizon)
     if path.exists() and not rebuild:
         return pl.read_parquet(path)
     t0 = time.time()
+    if horizon and horizon != HORIZON:
+        raise SystemExit(
+            f"выборки с горизонтом {horizon} нет в кэше: соберите её через "
+            f"src/fresh.py, здесь она только читается")
     df = build_dataset(cutoff, with_target=with_target, blocks=blocks, history=history,
                        net=net, net_feats=net_feats)
     df.write_parquet(path)
