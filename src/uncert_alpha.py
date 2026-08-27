@@ -31,7 +31,28 @@ alpha на валидации 1.010, а на тесте измерено 1.0586.
 `(p - m) * нормированное разногласие`, ортогонализованное к `(p - m)` и
 константе, и решается точно, как сдвиг, растяжение и кривизна.
 """
+import pathlib
+
 import numpy as np
+
+def _need(path):
+    """Внятный отказ вместо traceback.
+
+    Скрипт — разовый разбор, и он опирается на промежуточные файлы
+    конкретных прогонов. Если их нет, надо сказать какой прогон их
+    делает, а не падать на open() из недр numpy: репозиторий, где
+    вход валится сырым traceback, читается как сломанный.
+    """
+    p = pathlib.Path(path)
+    if not p.exists():
+        raise SystemExit(
+            f"нет промежуточного файла {p}.
+"
+            "Это разовый разбор поверх сохранённых предсказаний; сначала
+"
+            "нужен прогон, который их создаёт (см. заголовок файла).")
+    return path
+
 
 W = np.array([0.458, 0.097, 0.097, 0.348])
 FILES = {
@@ -65,14 +86,14 @@ def best_alpha(y, p, m, mask=None):
 
 
 for cut, (oof, nets) in FILES.items():
-    d = np.load(oof)
+    d = np.load(_need(oof))
     o = np.argsort(d["user_id"])
     uid, pb, t = d["user_id"][o], d["pred_log"][o], d["target"][o]
     y = np.log1p(t)
 
     P = [leveled(y, pb)]
     for f in nets:
-        q = np.load(f)
+        q = np.load(_need(f))
         z = np.empty(len(uid))
         z[np.searchsorted(uid, q["user_id"])] = q["pred_log"]
         P.append(leveled(y, z))

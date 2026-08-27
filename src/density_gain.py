@@ -41,6 +41,7 @@
 
     python -u src/density_gain.py
 """
+import pathlib
 import sys
 sys.path.insert(0, "src")
 import numpy as np
@@ -48,11 +49,30 @@ from config import MODELS, TEST_CUTOFF, train_cutoffs
 from metrics import gini_norm, rmse_log
 from seq_data import RAW_CHANNELS, build, gather, history_mask
 
+def _need(path):
+    """Внятный отказ вместо traceback.
+
+    Скрипт — разовый разбор, и он опирается на промежуточные файлы
+    конкретных прогонов. Если их нет, надо сказать какой прогон их
+    делает, а не падать на open() из недр numpy: репозиторий, где
+    вход валится сырым traceback, читается как сломанный.
+    """
+    p = pathlib.Path(path)
+    if not p.exists():
+        raise SystemExit(
+            f"нет промежуточного файла {p}.
+"
+            "Это разовый разбор поверх сохранённых предсказаний; сначала
+"
+            "нужен прогон, который их создаёт (см. заголовок файла).")
+    return path
+
+
 def leveled(y, p):
     return p + (y.mean() - p.mean())
 
 def aligned(path):
-    d = np.load(MODELS / path)
+    d = np.load(_need(MODELS / path))
     y = np.log1p(d["target"])
     p = leveled(y, d["pred_log"])
     return rmse_log(y, p), gini_norm(d["target"], np.expm1(np.clip(p, 0, None)))
