@@ -139,6 +139,21 @@ EXEMPT = {
 }
 
 
+def parse_slice(token: str) -> "tuple[dt.date, int]":
+    """`2025-12-16` или `2025-12-31@15` — срез и горизонт ЕГО окна цели.
+
+    Горизонт по умолчанию HORIZON. Суффикс нужен срезам с укороченным окном
+    (`src/fresh.py`): срез `val - 15` при горизонте 30 выглядел бы нарушением,
+    а при своём горизонте 15 кончается ровно на валидационном cutoff'е.
+
+    Без суффикса такой срез приходилось бы либо не записывать вовсе — и тогда
+    аудит его не видит, а «проверено» оказывается шире измерения, — либо
+    заносить прогон в исключения, что снимает проверку целиком.
+    """
+    date, _, h = token.partition("@")
+    return dt.date.fromisoformat(date), int(h) if h else HORIZON
+
+
 def check_cutoff_order(refs: list[str]) -> bool:
     """Журнал прогонов: окно цели обучения не достаёт до валидационного среза."""
     rows = journal_rows(refs)
@@ -158,14 +173,19 @@ def check_cutoff_order(refs: list[str]) -> bool:
             continue
         try:
             vc = dt.date.fromisoformat(v)
-            newest = max(dt.date.fromisoformat(x) for x in t.split())
+            slices = [parse_slice(x) for x in t.split()]
         except ValueError:
             noinfo += 1
             continue
+        newest = max(c for c, _ in slices)
         if newest >= vc:
             bad_order.append((r["name"], v, str(newest)))
-        if newest + dt.timedelta(days=HORIZON) > vc:
-            bad_overlap.append((r["name"], v, str(newest)))
+        # Проверяется КАЖДЫЙ срез своим горизонтом, а не самый свежий общим:
+        # при смешанных горизонтах самый свежий по дате может быть безопасен,
+        # а более старый с длинным окном — нет.
+        reach, worst = max((c + dt.timedelta(days=h), c) for c, h in slices)
+        if reach > vc:
+            bad_overlap.append((r["name"], v, str(worst)))
     print(f"  прогонов {len(rows)}, без записи о срезах {noinfo} "
           f"(ранние базовые линии до появления колонок и бленды без обучения)")
     print(f"  обучающий срез не старше валидационного: {len(bad_order)}")

@@ -298,7 +298,14 @@ def main() -> None:
              "commit": git_commit(), "feat_ver": features_version(blocks),
              "name": f"fresh_{args.mode}_h{h}", "model": "lgbm",
              "val_cutoff": str(val_cut),
-             "train_cutoffs": " ".join(str(c) for c in cuts if c < val_cut),
+             # Частичные срезы записываются ТОЖЕ, с суффиксом горизонта: без
+             # них аудит не видел именно те два среза, ради которых прогон и
+             # ставился. Срез val-15 при горизонте 30 выглядел бы нарушением,
+             # при своём 15 кончается ровно на валидации — суффикс отличает
+             # одно от другого, не выводя прогон в исключения.
+             "train_cutoffs": " ".join(
+                 [str(c) for c in cuts if c < val_cut]
+                 + [f"{fresh_cut}@{h}", f"{ctl_cut}@{h}"]),
              "rmsle_single": round(base, 5),
              "rmsle_two_stage": round(float(np.mean(table["B свежий"])), 5),
              "rmsle_blend": round(float(np.mean(table["C контроль"])), 5),
