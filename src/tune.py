@@ -21,19 +21,37 @@ import numpy as np
 
 from config import MODELS, SEED
 from datasets import parse_blocks
+from features.net import FEATS as NET_FEATS
 from metrics import rmse_log
 from models import GBM
 from train import load_split, to_xy
 from utils import append_csv, git_commit
 
 # broad — первая серия. Строилась от гипотезы «ранняя остановка = деревья
-# слишком сложные», поэтому включала простые варианты. Гипотеза не подтвердилась:
-# все варианты с 255 листьями заняли первые места, все с 31 — последние,
-# 63 и 127 ровно посередине, без единого исключения.
+# слишком сложные», поэтому включала простые варианты.
 #
-# deep — вторая серия вокруг найденного угла: число листьев вынесено за прежнюю
-# границу (оптимум лежал на краю сетки), а сдерживать переобучение при таких
-# деревьях должен размер листа и доля признаков.
+# ВНИМАНИЕ: вывод первой серии был обратным нынешнему и держался на дефекте.
+# Пока остановка шла по сырому RMSLE, все варианты с 255 листьями занимали
+# первые места, а с 31 — последние. Причина в том, что сырая метрика обрывала
+# обучение тем раньше, чем медленнее модель уезжала по уровню, и крупные
+# деревья успевали набрать форму до обрыва, а мелкие — нет. После починки
+# (см. models.aligned_rmsle) те же 40 конфигураций от того же сида дают
+# ровно противоположный порядок, монотонный и без исключений:
+#
+#     листьев   лучший     средний    попыток
+#        31     1.66936    1.66956       9
+#        63     1.66941    1.66968      12
+#       127     1.66969    1.66989       8
+#       255     1.66972    1.67024      11
+#
+# deep — вторая серия, построенная вокруг ТОГО САМОГО перевёрнутого вывода:
+# листья вынесены вверх, до 1023. Теперь известно, что это движение в худшую
+# сторону, и серия оставлена только для воспроизводимости журнала.
+#
+# small — третья серия, вокруг настоящего угла. Оптимум снова лежит на краю
+# сетки (31 — наименьшее из пробованных и лучшее), поэтому граница вынесена
+# вниз, до 7 листьев. Доля признаков 0.5 стоит у пяти из шести лучших, так
+# что сетка по ней сдвинута туда же.
 SPACES = {
     "broad": {
         "learning_rate": [0.01, 0.02, 0.03, 0.05],
@@ -53,10 +71,19 @@ SPACES = {
         "lambda_l2": [1.0, 5.0, 20.0],
         "max_bin": [127, 255],
     },
+    "small": {
+        "learning_rate": [0.01, 0.015, 0.02, 0.03],
+        "num_leaves": [7, 15, 31, 63],
+        "min_data_in_leaf": [100, 200, 500, 1000, 2000],
+        "feature_fraction": [0.35, 0.5, 0.65],
+        "bagging_fraction": [0.7, 0.85, 1.0],
+        "lambda_l2": [1.0, 5.0, 20.0, 100.0],
+        "max_bin": [127, 255],
+    },
 }
 
-FIELDS = ["created", "commit", "space", "val_cutoff", "rmsle", "best_iter", "seconds",
-          *SPACES["broad"].keys(), "note"]
+FIELDS = ["created", "commit", "space", "val_cutoff", "rmsle", "rmsle_aligned", "shift",
+          "best_iter", "seconds", *SPACES["broad"].keys(), "note"]
 
 
 def sample_params(rng: np.random.Generator, space: dict) -> dict:
@@ -82,6 +109,13 @@ def parse_params(text: str) -> dict:
     return out
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=24)
@@ -90,11 +124,18 @@ def main() -> None:
     ap.add_argument("--early-stopping", type=int, default=300)
     ap.add_argument("--val-cutoff", default=None)
     ap.add_argument("--blocks", default=None)
+    ap.add_argument("--net", action="store_true",
+                    help="признак предсказания сети (features/net.py)")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
+    ap.add_argument("--net-feats", default="rank_centered", choices=list(NET_FEATS),
+                    help="какие признаки брать у сети: rank_centered (умолчание, без уровня), "
+                         "raw (сырое предсказание с уровнем), all (и то, и другое)")
     ap.add_argument("--history", type=int, default=None,
                     help="обрезать историю до K дней на всех срезах")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--space", default="broad", choices=sorted(SPACES),
-                    help="broad — первая, широкая сетка; deep — вокруг найденного угла")
+                    help="broad — широкая; deep — вокруг ложного угла, оставлена для истории; small — вокруг настоящего")
     ap.add_argument("--params", default=None,
                     help="конкретная конфигурация вместо перебора: пары вида "
                          "num_leaves=511,learning_rate=0.02 или JSON")
@@ -109,7 +150,9 @@ def main() -> None:
 
     val_cutoff = dt.date.fromisoformat(args.val_cutoff) if args.val_cutoff else None
     train, val, feats, cuts = load_split(args.cutoffs, blocks=parse_blocks(args.blocks),
-                                         val_cutoff=val_cutoff, history=args.history)
+                                         val_cutoff=val_cutoff, history=args.history,
+                                         net=parse_net(args.net, args.net_names),
+                                         net_feats=args.net_feats)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -125,16 +168,26 @@ def main() -> None:
         m = GBM("lgbm", "reg", "cpu", n_estimators=args.rounds,
                 early_stopping=args.early_stopping, params=params, log_period=0)
         m.fit(Xtr, ytr_log, Xva, yva_log, feature_names=feats)
-        score = rmse_log(yva_log, m.predict(Xva))
+        pred = m.predict(Xva)
+        score = rmse_log(yva_log, pred)
+        # Выровненный RMSLE: уровень предсказаний приводится к истинному уровню
+        # окна — ровно то, что делает бесплатный сдвиг на сабмите. Без этого
+        # сравнение смешивает «модель лучше по существу» и «повезло с уровнем»,
+        # а второе на лидерборде не засчитывается. Дважды обожглись: блок ranks
+        # давал 0.0033 на валидации и 0.00037 на public.
+        shift = float(yva_log.mean() - pred.mean())
+        aligned = rmse_log(yva_log, pred + shift)
         secs = time.time() - t0
         results.append((score, m.best_iter, params))
-        print(f"[{i:>2}/{args.trials}] RMSLE {score:.5f} | итераций {m.best_iter:>5} | {secs:>5.0f}s | "
+        print(f"[{i:>2}/{args.trials}] RMSLE {score:.5f} | выровненный {aligned:.5f} "
+              f"(сдвиг {shift:+.4f}) | итераций {m.best_iter:>5} | {secs:>5.0f}s | "
               + " ".join(f"{k}={v}" for k, v in params.items()))
 
         append_csv(MODELS / "tuning.csv", FIELDS, {
             "created": dt.datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
             "space": args.space, "val_cutoff": str(cuts[0]),
-            "rmsle": round(score, 5), "best_iter": m.best_iter,
+            "rmsle": round(score, 5), "rmsle_aligned": round(aligned, 5),
+            "shift": round(shift, 5), "best_iter": m.best_iter,
             "seconds": round(secs), **params, "note": args.note,
         })
 

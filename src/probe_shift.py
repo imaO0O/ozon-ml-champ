@@ -144,6 +144,76 @@ def quad_basis(p: np.ndarray) -> np.ndarray:
     return g
 
 
+def feature_basis(p: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Направление вдоль признака, очищенное от всех уже исправленных.
+
+    Сдвиг, растяжение и кривизна исправляют предсказание как функцию его самого.
+    Но остаток может зависеть и от **клиента** — например, модель систематически
+    занижает активным и завышает спящим. Замер на валидации: после полной
+    калибровки остаток коррелирует с числом активных дней на t = -8.1, а шесть
+    признаков совместно дают потолок 0.00053.
+
+    Почему это не та посегментная калибровка, которую мы отвергли. Ту оценивали
+    **на валидации** и требовали переноса на тест — а смещения по сегментам
+    между срезами меняли знак. Здесь коэффициент меряется зондом **прямо
+    на тестовом окне**, поэтому переносить нечего: сколько там есть, столько
+    и возьмём.
+
+    Направление ортогонализуется к константе, к предсказанию и к его квадрату —
+    иначе зонд частично повторил бы уже применённые поправки и сбил бы их.
+    """
+    u = p - p.mean()
+    g = np.nan_to_num(values.astype(np.float64))
+    for basis in (np.ones_like(u), u, quad_basis(p)):
+        g = g - basis * (g @ basis) / (basis @ basis)
+    return g
+
+
+def feature_submission(source: str, feature: str, step: float, out: str | None) -> None:
+    """Зонд вдоль признака: p + step * g, где g — очищенное направление."""
+    import datetime as _dt
+    from config import TEST_CUTOFF
+    from datasets import get_dataset
+
+    src = SUBMISSIONS / source
+    sub = pl.read_csv(src)
+    p = np.log1p(sub["predict"].to_numpy().astype(np.float64))
+
+    ds = get_dataset(TEST_CUTOFF, with_target=False)
+    if feature not in ds.columns:
+        raise SystemExit(f"нет признака {feature!r}; есть, например: "
+                         + ", ".join(c for c in ds.columns[:12]))
+    frame = (sub.select("user_id")
+             .join(ds.select(["user_id", feature]), on="user_id", how="left"))
+    g = feature_basis(p, frame[feature].to_numpy())
+    g = g / np.sqrt(float(g @ g / len(g)))        # единичная дисперсия — шаг сравним между признаками
+
+    probed = np.clip(np.expm1(p + step * g), 0, None)
+    name = out or f"probe_{feature}_{step:+.3f}.csv".replace("+", "p")
+    path = SUBMISSIONS / name
+    if path.exists():
+        raise SystemExit(f"{path.name} уже существует — задайте --out")
+    pl.DataFrame({"user_id": sub["user_id"],
+                  "predict": probed.astype(np.float32)}).write_csv(path)
+
+    print(f"{path}")
+    print(f"  исходный файл: {source} | признак {feature} | шаг {step:+.4f}")
+    print(f"  Var(g) = 1.00000  <- нужна для разбора (направление нормировано)")
+    print(f"  среднее сдвига: {float(np.mean(step * g)):+.2e} (должно быть ~0)")
+    print(f"  сумма: {np.expm1(p).sum():,.0f} -> {probed.sum():,.0f}")
+
+    append_csv(SUBMISSIONS / "log.csv",
+               ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
+                "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"],
+               {"file": name, "created": dt.datetime.now().isoformat(timespec="seconds"),
+                "commit": git_commit(), "name": "probe", "model": "feature",
+                "pred_sum": round(float(probed.sum())),
+                "pred_zeros": f"{(probed < 1e-6).mean():.4f}",
+                "note": f"зонд вдоль признака {feature}: {source}, шаг {step:+.4f}, "
+                        f"направление нормировано (Var=1), ортогонально сдвигу, "
+                        f"растяжению и кривизне"})
+
+
 def quad_submission(source: str, gamma: float, out: str | None) -> None:
     src = SUBMISSIONS / source
     sub = pl.read_csv(src)
@@ -241,6 +311,12 @@ def main() -> None:
                     help="Var(log1p(предсказаний)) — печатается при создании зонда размаха")
     ap.add_argument("--derive-shift", action="store_true",
                     help="вывести сдвиг из известного уровня тестового окна, без сабмита")
+    ap.add_argument("--feature", default=None,
+                    help="зонд вдоль признака: поправка, зависящая от клиента, "
+                         "а не от величины предсказания (например lt_active_days)")
+    ap.add_argument("--step", type=float, default=0.02,
+                    help="шаг зонда вдоль признака; направление нормировано, "
+                         "поэтому шаг сравним между признаками")
     ap.add_argument("--solve", action="store_true", help="решить по двум ответам лидерборда")
     ap.add_argument("--mse0", type=float, help="RMSLE исходного сабмита")
     ap.add_argument("--mse1", type=float, help="RMSLE сабмита-зонда")
@@ -253,7 +329,10 @@ def main() -> None:
     elif args.solve:
         if args.mse0 is None or args.mse1 is None:
             raise SystemExit("нужны --mse0 и --mse1")
-        if args.gamma is not None:
+        if args.feature is not None:
+            solve_direction(args.mse0, args.mse1, args.step, 1.0,
+                            f"поправка вдоль {args.feature}")
+        elif args.gamma is not None:
             if args.var_g is None:
                 raise SystemExit("для квадратичного зонда нужен --var-g")
             solve_direction(args.mse0, args.mse1, args.gamma, args.var_g, "кривизна")
@@ -263,6 +342,10 @@ def main() -> None:
             solve_scale(args.mse0, args.mse1, args.alpha, args.var_p)
         else:
             solve(args.mse0, args.mse1, args.delta)
+    elif args.feature is not None:
+        if not args.source:
+            raise SystemExit("нужен --source")
+        feature_submission(args.source, args.feature, args.step, args.out)
     elif args.gamma is not None:
         if not args.source:
             raise SystemExit("нужен --source")

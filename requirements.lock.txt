@@ -1,0 +1,38 @@
+# Точные версии, на которых получены все числа в журналах.
+# Снято на боевой машине трека A: Python 3.12.10, Windows 11, CPU.
+#
+# requirements.txt задаёт нижние границы и годится для установки.
+# Этот файл нужен, чтобы воспроизвести числа: другая минорная версия LightGBM
+# сдвигает точку ранней остановки, а с ней RMSLE — при пороге различимости
+# 0.002 это существенно.
+#
+#     pip install -r requirements.lock.txt
+#
+catboost==1.2.10
+colorama==0.4.6
+contourpy==1.3.3
+cycler==0.12.1
+fonttools==4.63.0
+graphviz==0.21
+joblib==1.5.3
+kiwisolver==1.5.0
+lightgbm==4.7.0
+matplotlib==3.11.1
+narwhals==2.24.0
+numpy==2.5.2
+packaging==26.3
+pandas==3.0.5
+pillow==12.3.0
+plotly==6.9.0
+polars==1.43.2
+polars-runtime-32==1.43.2
+pyarrow==25.0.1
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+scikit-learn==1.9.0
+scipy==1.18.0
+six==1.17.0
+threadpoolctl==3.6.0
+tqdm==4.70.0
+tzdata==2026.3
+xgboost==3.4.0

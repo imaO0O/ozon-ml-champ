@@ -20,15 +20,18 @@ import numpy as np
 import polars as pl
 
 from config import CUTOFF_STRIDE, HORIZON, MODELS, SEED, train_cutoffs
-from datasets import feature_names, features_version, get_dataset, parse_blocks
+from datasets import (feature_names, features_version, get_dataset, parse_blocks,
+                      rank_stamps)
 from metrics import report, rmse_log
-from models import GBM, Ensemble
+from models import GBM, LGB_SINGLE_TUNED, Ensemble
 from utils import append_csv, git_commit
 
 
 def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None = None,
                val_cutoff: dt.date | None = None, explicit_train: list[dt.date] | None = None,
-               stride: int | None = None, history: int | None = None):
+               stride: int | None = None, history: int | None = None, net: bool = False,
+               net_feats: str = "rank_centered", drop_stamps: bool = False,
+               rank_stamps_flag: bool = False):
     """По умолчанию — валидация на самом свежем срезе, обучение на всех предыдущих.
 
     `val_cutoff` и `explicit_train` позволяют собрать нестандартную пару: например,
@@ -51,9 +54,22 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     if not train_cuts:
         raise SystemExit(f"нет обучающих срезов раньше {latest_ok}: увеличьте --cutoffs")
     cuts = [val_cut, *train_cuts]
-    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history)
-    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history) for c in train_cuts]
+    val = get_dataset(val_cut, rebuild=rebuild, blocks=blocks, history=history, net=net,
+                      net_feats=net_feats)
+    trains = [get_dataset(c, rebuild=rebuild, blocks=blocks, history=history, net=net,
+                          net_feats=net_feats)
+              for c in train_cuts]
+    if rank_stamps_flag:
+        # Каждый срез ранжируется отдельно: ранг по объединённой выборке вернул
+        # бы ровно ту привязку к дате, ради снятия которой всё и делается.
+        val = rank_stamps(val)
+        trains = [rank_stamps(t) for t in trains]
+        print("датчики времени заменены рангом внутри среза")
     feats = feature_names(val)
+    if drop_stamps:
+        gone = [f for f in feats if f in DATE_STAMPS]
+        feats = [f for f in feats if f not in DATE_STAMPS]
+        print(f"сняты датчики времени ({len(gone)}): {', '.join(gone)}")
     # _gap — на сколько дней срез примера отстоит от валидации. Не признак:
     # feats берётся из колонок val, поэтому в X эта колонка не попадёт.
     trains = [
@@ -65,6 +81,22 @@ def load_split(n_cutoffs: int, rebuild: bool = False, blocks: list[str] | None =
     train = pl.concat(trains, how="vertical")
     print(f"train: {train.height:,} строк ({len(train_cuts)} cutoff) | val: {val.height:,} ({val_cut})")
     return train, val, feats, cuts
+
+
+DATE_STAMPS = ("tenure", "first_ord_ago", "active_months",
+               "day_crowd_mean_30", "day_crowd_mean_90", "day_crowd_mean_365")
+"""Признаки, монотонно растущие с датой среза.
+
+Для одного и того же клиента они однозначно кодируют дату среза, а на тесте
+выходят за обучающий диапазон: tenure идёт 205.9 -> 337.6 по обучающим срезам,
+на тесте 367.6. Деревья за границу не экстраполируют, поэтому по разбиению
+вида `tenure > порог` весь тест уходит в одну сторону, и к нему применяется
+поправка, выученная на самом свежем обучающем срезе.
+
+Список получен измерением: дискриминатор «свежий срез против старых» даёт
+AUC = 1.0000, и 66% его выигрыша приходится на первые три из этих величин.
+Снятие их дало +0.00097 и +0.00029 на двух срезах (src/date_stamp.py).
+"""
 
 
 def to_xy(df: pl.DataFrame, feats: list[str]):
@@ -86,14 +118,19 @@ def recency_weights(train: pl.DataFrame, halflife: float) -> np.ndarray | None:
     return (0.5 ** (gap / halflife)).astype(np.float32)
 
 
-def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None):
+def fit_single(X, ylog, Xv, yvlog, feats, kind, device, rounds=6000, w=None, members=None,
+               tuned=True):
     """Одна модель или ансамбль разнородных конфигураций (см. ensemble.py).
 
     Ансамбль выигрывает у рабочего умолчания на обоих валидационных срезах,
     тогда как отдельные конфигурации-чемпионы между срезами не переносятся.
     """
     if not members:
-        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds)
+        # Настроенные параметры получает ТОЛЬКО одиночная рука. Двухэтапная
+        # модель остаётся на умолчаниях: она здесь партнёр по бленду, и
+        # сближать её с одиночной невыгодно (см. LGB_SINGLE_TUNED).
+        m = GBM(kind=kind, task="reg", device=device, n_estimators=rounds,
+                params=LGB_SINGLE_TUNED if (tuned and kind == "lgbm") else None)
         m.fit(X, ylog, Xv, yvlog, feature_names=feats, sample_weight=w)
         return m
 
@@ -122,11 +159,32 @@ def two_stage_predict(clf: GBM, reg: GBM, X) -> np.ndarray:
     return clf.predict(X) * reg.predict(X)
 
 
+def parse_net(flag: bool, names: str | None):
+    """True = одна безымянная сеть, список имён = стекинг на нескольких."""
+    if names:
+        return [n.strip() for n in names.split(",") if n.strip()]
+    return bool(flag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lgbm", choices=["lgbm", "cat", "xgb"])
     ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
-    ap.add_argument("--cutoffs", type=int, default=6)
+    # Девять обучающих срезов, а не пять. Замер 24.08 на починенном смесителе,
+    # обе руки одним протоколом:
+    #
+    #     глубина     строк      январь     декабрь
+    #     5 срезов   1205328    1.66911    1.73607
+    #     7 срезов   1659719    1.66898    1.73566
+    #     9 срезов   2097330    1.66895    1.73559
+    #                           +0.00016   +0.00048
+    #
+    # Знак сходится на обоих срезах. Глубже не идём: кривая насыщается (7 -> 9
+    # дал вшестеро меньше, чем 5 -> 7), а данные начинаются 01.01.2025, и на
+    # двенадцати срезах у самого старого осталось бы двадцать дней истории.
+    ap.add_argument("--cutoffs", type=int, default=10,
+                    help="сколько срезов брать всего; первый идёт на валидацию, "
+                         "остальные в обучение")
     ap.add_argument("--rounds", type=int, default=6000)
     ap.add_argument("--rebuild", action="store_true", help="пересобрать признаки, игнорируя кэш")
     ap.add_argument("--name", default=None, help="имя артефактов (по умолчанию = --model)")
@@ -146,6 +204,27 @@ def main() -> None:
                     help="одноголовую модель заменить ансамблем конфигураций из ensemble.py")
     ap.add_argument("--members", default="lgb",
                     help="состав ансамбля: lgb (рабочий), cat, mixed — см. ensemble.py")
+    ap.add_argument("--net", action="store_true",
+                    help="добавить предсказание сети признаком (стекинг, см. features/net.py)")
+    ap.add_argument("--rank-stamps", action="store_true",
+                    help="заменить датчики времени процентильным рангом внутри "
+                         "среза. Лучше и сохранения, и удаления на обоих срезах: "
+                         "+0.00107 и +0.00082 против +0.00097 и +0.00029 "
+                         "(src/date_stamp.py)")
+    ap.add_argument("--drop-stamps", action="store_true",
+                    help="снять признаки, монотонно растущие с датой среза "
+                         "(tenure, day_crowd_mean_*, first_ord_ago, active_months). "
+                         "На тесте они выходят за обучающий диапазон, а деревья "
+                         "за него не экстраполируют — см. DATE_STAMPS")
+    ap.add_argument("--net-names", default=None,
+                    help="имена сетей через запятую для стекинга на нескольких, например r180,ch180,w90")
+    ap.add_argument("--plain-single", action="store_true",
+                    help="одиночная рука на умолчаниях конвейера, без настроенных "
+                         "параметров LGB_SINGLE_TUNED — нужен для контрольных прогонов, "
+                         "чтобы не править код ради сравнения")
+    ap.add_argument("--save-val-pred", action="store_true",
+                    help="сохранить предсказания на валидации в models/<имя>_valpred_<срез>.npz "
+                         "(user_id, pred_log, target) — для обмена с другими треками")
     args = ap.parse_args()
     name = args.name or args.model
     blocks = parse_blocks(args.blocks)
@@ -155,7 +234,9 @@ def main() -> None:
 
     train, val, feats, cuts = load_split(args.cutoffs, rebuild=args.rebuild, blocks=blocks,
                                          val_cutoff=val_cutoff, explicit_train=explicit_train,
-                                         stride=args.stride)
+                                         stride=args.stride, net=parse_net(args.net, args.net_names),
+                                         drop_stamps=args.drop_stamps,
+                                         rank_stamps_flag=args.rank_stamps)
     Xtr, ytr = to_xy(train, feats)
     Xva, yva = to_xy(val, feats)
     ytr_log, yva_log = np.log1p(ytr), np.log1p(yva)
@@ -181,7 +262,7 @@ def main() -> None:
               + ", ".join(n for n, _, _ in members))
 
     single = fit_single(Xtr, ytr_log, Xva, yva_log, feats, args.model, args.device, args.rounds,
-                        w=sw, members=members)
+                        w=sw, members=members, tuned=not args.plain_single)
     p_single = single.predict(Xva)
     clf, reg = fit_two_stage(Xtr, ytr, Xva, yva, feats, args.model, args.device, args.rounds, w=sw)
     p_two = two_stage_predict(clf, reg, Xva)
@@ -191,13 +272,37 @@ def main() -> None:
     res["single"] = report(yva, np.expm1(p_single), "single")
     res["two_stage"] = report(yva, np.expm1(p_two), "two-stage")
 
+    # Вес выбирается по ВЫРОВНЕННОМУ RMSLE. Сырая величина включает уровень,
+    # а он на сабмите правится бесплатным сдвигом из TEST_LEVEL и в зачёт
+    # не идёт. У одиночной и двухэтапной руки уровни РАЗНЫЕ, поэтому смесь
+    # меняет и форму, и уровень; выбирая по сырому, смеситель чинит уровень
+    # за счёт формы и останавливается не на том весе.
+    #
+    # Это тот же дефект, что был у ранней остановки (см. models.aligned_rmsle),
+    # только в другом месте, и он задел все прогоны train.py до 24.08.
+    # Обнаружен по невозможному признаку: у руки с лучшей одиночной моделью
+    # смеситель выставил w=1.00, то есть выкинул двухэтапную руку целиком,
+    # хотя обе руки были те же, что в контроле.
     best_w, best_rmse = 0.0, float("inf")
     for w in np.linspace(0, 1, 21):
-        r = rmse_log(yva_log, w * p_two + (1 - w) * p_single)
+        p = w * p_two + (1 - w) * p_single
+        r = rmse_log(yva_log, p - p.mean() + yva_log.mean())
         if r < best_rmse:
             best_w, best_rmse = float(w), r
     p_blend = best_w * p_two + (1 - best_w) * p_single
     res["blend"] = report(yva, np.expm1(p_blend), f"blend w={best_w:.2f}")
+
+    # Обмен предсказаниями между треками: чтобы посчитать метрику совместного
+    # состава, не нужно передавать ни веса, ни код — достаточно предсказаний
+    # на одном и том же срезе. Уровень выравнивается по истине, иначе состав
+    # сравнивать нельзя: разница уровней подмешалась бы в результат бленда.
+    if args.save_val_pred:
+        aligned = p_blend - p_blend.mean() + yva_log.mean()
+        path = MODELS / f"{name}_valpred_{cuts[0]}.npz"
+        np.savez_compressed(path, user_id=val["user_id"].to_numpy(),
+                            pred_log=aligned, target=yva)
+        print(f"\nпредсказания валидации -> {path.name} "
+              f"({len(aligned):,} строк, уровень выровнен по истине)")
 
     print("\ntop-20 признаков (gain, single):")
     for f, g in single.feature_importance(feats)[:20]:
@@ -207,7 +312,8 @@ def main() -> None:
         "name": name, "model": args.model, "device": args.device,
         "features": feats, "blend_w": best_w, "val_cutoff": str(cuts[0]),
         "metrics": res, "seed": SEED, "features_version": features_version(blocks),
-        "blocks": blocks or "all",
+        "blocks": blocks or "all", "net": parse_net(args.net, args.net_names),
+        "rank_stamps": args.rank_stamps,
         "best_iter": {"single": single.best_iter, "clf": clf.best_iter, "reg": reg.best_iter},
     }
 
@@ -264,7 +370,10 @@ def main() -> None:
             f_single = Ensemble(fitted, [n for n, _, _ in members])
         else:
             f_single = GBM(args.model, "reg", args.device, int(single.best_iter * scale),
-                           early_stopping=0)
+                           early_stopping=0,
+                           params=(LGB_SINGLE_TUNED
+                                   if (not args.plain_single and args.model == "lgbm")
+                                   else None))
             f_single.fit(Xall, yall_log, feature_names=feats, sample_weight=sw_all)
         f_clf = GBM(args.model, "bin", args.device, int(clf.best_iter * scale), early_stopping=0)
         f_clf.fit(Xall, (yall > 0).astype(np.int8), feature_names=feats, sample_weight=sw_all)

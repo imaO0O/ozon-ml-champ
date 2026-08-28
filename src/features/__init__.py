@@ -14,7 +14,7 @@ import datetime as dt
 
 import polars as pl
 
-from config import HORIZON, TRAIN_PARQUET
+from config import HORIZON, TEST_CUTOFF, TRAIN_PARQUET
 
 from .registry import BLOCKS, Block, aggs_block, derived_block, selected
 
@@ -90,7 +90,8 @@ def build_target(cutoff: dt.date, lf: pl.LazyFrame | None = None) -> pl.DataFram
 
 
 def build_dataset(cutoff: dt.date, with_target: bool = True,
-                  blocks: list[str] | None = None, history: int | None = None) -> pl.DataFrame:
+                  blocks: list[str] | None = None, history: int | None = None,
+                  net: bool = False, net_feats: str = "rank_centered") -> pl.DataFrame:
     """history — обрезать историю до одинаковой глубины на всех срезах.
 
     Данные начинаются 2025-01-01, поэтому у старого обучающего среза истории
@@ -102,11 +103,20 @@ def build_dataset(cutoff: dt.date, with_target: bool = True,
 
     Таргет берётся из полного лога: обрезка касается только признаков.
     """
+    enable_optional(blocks)
     lf = scan_log()
     feat_lf = lf
     if history:
         feat_lf = lf.filter(pl.col("event_date") >= cutoff - dt.timedelta(days=history))
     df = build_features(cutoff, feat_lf, blocks=blocks)
+    if net:
+        # Предсказания сетей из внешних файлов — не выражения над логом,
+        # поэтому подключаются здесь, а не блоком реестра.
+        # net может быть True (одна безымянная сеть) или списком имён.
+        from .net import attach as attach_net  # noqa: PLC0415
+
+        names = None if net is True else list(net)
+        df = attach_net(df, cutoff, TEST_CUTOFF, names=names, feats=net_feats)
     if with_target:
         tgt = build_target(cutoff, lf)
         df = df.join(tgt, on="user_id", how="left").with_columns(
@@ -122,4 +132,25 @@ from . import lifetime  # noqa: E402,F401
 from . import ratios  # noqa: E402,F401
 from . import platform  # noqa: E402,F401
 from . import unit  # noqa: E402,F401
+# shape намеренно НЕ импортируется: блок проверен и отвергнут (знак выигрыша
+# скачет между срезами, разбор в самом модуле). Импорт здесь означал бы, что
+# он входит в состав по умолчанию и удорожает каждый прогон на 30 признаков.
+# Модуль оставлен как задокументированный отрицательный результат; чтобы
+# перепроверить, импортируйте его руками или зовите с --blocks shape.
 from . import ranks  # noqa: E402,F401  (последним: ранжирует уже готовые признаки)
+
+# Блоки, проверенные и отвергнутые. Не импортируются вместе с остальными: иначе
+# они входили бы в состав по умолчанию, удорожая каждый прогон ради признаков,
+# от которых мы отказались. Но и удалять их незачем — они ценны как
+# задокументированный отрицательный результат, и перепроверить должно быть
+# дёшево. Поэтому подключаются по явному запросу: --blocks shape.
+OPTIONAL_BLOCKS = {"shape", "burst"}
+
+
+def enable_optional(blocks: "list[str] | None") -> None:
+    """Подключить отвергнутый блок, если его назвали в --blocks."""
+    import importlib
+
+    for name in blocks or ():
+        if name in OPTIONAL_BLOCKS and name not in BLOCKS:
+            importlib.import_module(f".{name}", __name__)

@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 
 from config import MODELS, SAMPLE_SUBMIT, SUBMISSIONS, TEST_CUTOFF
-from datasets import get_dataset
+from datasets import get_dataset, rank_stamps
 from models import GBM
 from utils import append_csv, git_commit
 
@@ -18,9 +18,19 @@ ZERO_FILL_HINTS = ("_sum_", "_days_", "active_days", "ord_days", "lt_")
 
 
 def build_test_frame(features: list[str], rebuild: bool = False,
-                     blocks: list[str] | None = None) -> tuple[pl.Series, np.ndarray]:
+                     blocks: list[str] | None = None,
+                     net: bool = False,
+                     rank_stamps_flag: bool = False) -> tuple[pl.Series, np.ndarray]:
+    """net берётся из меты обучения: тестовая выборка должна собираться тем же
+    набором признаков, что и обучающая, иначе колонок просто не окажется."""
     users = pl.read_csv(SAMPLE_SUBMIT).select("user_id")
-    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks)
+    feats = get_dataset(TEST_CUTOFF, with_target=False, rebuild=rebuild, blocks=blocks, net=net)
+    if rank_stamps_flag:
+        # Тот же ранг внутри среза, что применялся на обучении. Без этого
+        # модель получила бы на тесте абсолютные величины там, где училась
+        # на рангах, и молча поехала бы — колонки-то на месте.
+        feats = rank_stamps(feats)
+        print("датчики времени заменены рангом внутри тестового среза")
     df = users.join(feats, on="user_id", how="left")
     missing = df[features[0]].null_count()
     if missing:
@@ -28,6 +38,14 @@ def build_test_frame(features: list[str], rebuild: bool = False,
     fills = [pl.col(c).fill_null(0.0) for c in features if any(h in c for h in ZERO_FILL_HINTS)]
     if fills:
         df = df.with_columns(fills)
+    missing_cols = [c for c in features if c not in df.columns]
+    if missing_cols:
+        raise SystemExit(
+            f"в тестовой выборке нет {len(missing_cols)} признаков обучения: "
+            f"{', '.join(missing_cols[:6])}"
+            + (" ..." if len(missing_cols) > 6 else "")
+            + " | тест собран другим набором признаков, чем обучение: "
+              "чаще всего разошёлся net в мете (стекинг на именованных сетях)")
     X = df.select(features).to_numpy().astype(np.float32)
     return df["user_id"], X
 
@@ -51,14 +69,30 @@ def main() -> None:
     ap.add_argument("--note", default="", help="комментарий для журнала сабмитов")
     args = ap.parse_args()
 
-    meta = json.loads((MODELS / f"{args.name}_meta.json").read_text(encoding="utf-8"))
+    # Мета создаётся только вместе с весами, то есть под --final. Без неё
+    # прежняя проверка была недостижима: чтение падало трейсбеком строкой выше.
+    meta_path = MODELS / f"{args.name}_meta.json"
+    if not meta_path.exists():
+        have = sorted(p.stem[:-5] for p in MODELS.glob("*_meta.json"))
+        raise SystemExit(
+            f"нет моделей с именем '{args.name}': обучите их командой "
+            f"train.py --final --name {args.name}"
+            + (f"\nготовые имена: {', '.join(have)}" if have else ""))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not meta.get("final"):
         raise SystemExit(f"модели '{args.name}' обучены без --final, для сабмита переобучите train.py --final")
     features, w = meta["features"], meta["blend_w"]
     # Тестовые признаки собираем тем же набором блоков, что и обучающие.
     blocks = meta.get("blocks") if meta.get("blocks") != "all" else None
 
-    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks)
+    # net из меты передаётся КАК ЕСТЬ, а не через bool(): при стекинге на
+    # нескольких сетях там лежит список имён (["dr", "sh"]), и приведение к
+    # логическому значению превращало его в «одна безымянная сеть». Тест
+    # собирался тогда с колонками net_rank/net_centered, которых модель не
+    # видела, и падал на выборке признаков.
+    user_id, X = build_test_frame(features, rebuild=args.rebuild, blocks=blocks,
+                                  rank_stamps_flag=bool(meta.get("rank_stamps")),
+                                  net=meta.get("net", False))
     single = GBM.load(MODELS / f"{args.name}_single.pkl")
     clf = GBM.load(MODELS / f"{args.name}_clf.pkl")
     reg = GBM.load(MODELS / f"{args.name}_reg.pkl")
