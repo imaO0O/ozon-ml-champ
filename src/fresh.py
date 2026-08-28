@@ -286,12 +286,19 @@ def main() -> None:
 
         append_csv(
             MODELS / "experiments.csv",
+            # `train_cutoffs` пишется не для порядка, а чтобы прогон был
+            # ПРОВЕРЯЕМ: `src/leak_audit.py` сверяет по этой колонке, что окно
+            # цели обучения не достаёт до валидационного среза. Без неё восемь
+            # прогонов A/B/C выпадали из аудита утечки — не как подозрительные,
+            # а как непроверяемые, что хуже.
             ["created", "commit", "feat_ver", "name", "model", "note",
-             "val_cutoff", "rmsle_single", "rmsle_two_stage", "rmsle_blend"],
+             "val_cutoff", "train_cutoffs", "rmsle_single", "rmsle_two_stage",
+             "rmsle_blend"],
             {"created": dt.datetime.now().isoformat(timespec="seconds"),
              "commit": git_commit(), "feat_ver": features_version(blocks),
              "name": f"fresh_{args.mode}_h{h}", "model": "lgbm",
              "val_cutoff": str(val_cut),
+             "train_cutoffs": " ".join(str(c) for c in cuts if c < val_cut),
              "rmsle_single": round(base, 5),
              "rmsle_two_stage": round(float(np.mean(table["B свежий"])), 5),
              "rmsle_blend": round(float(np.mean(table["C контроль"])), 5),

@@ -127,9 +127,28 @@ def journal_rows(refs: list[str]) -> list[dict]:
     return rows
 
 
+# Диагностики, которым обратный порядок срезов положен ПО ЗАМЫСЛУ.
+# Список именной и с причиной — правило не ослабляется, исключение видно.
+# Ослабить условие было бы проще и хуже: тогда настоящая утечка того же вида
+# прошла бы молча.
+EXEMPT = {
+    "residual_composition_C":
+        "диагностика C-1 «предсказуем ли остаток состава»: ставится симметрично "
+        "в обе стороны по замыслу, бустинг останавливается на 1-й итерации "
+        "(корр −0.0067), в модели не входила",
+}
+
+
 def check_cutoff_order(refs: list[str]) -> bool:
     """Журнал прогонов: окно цели обучения не достаёт до валидационного среза."""
     rows = journal_rows(refs)
+    exempted = sum(1 for r in rows if r.get("name") in EXEMPT)
+    if exempted:
+        print(f"  исключений по замыслу: {exempted}")
+        for nm, why in EXEMPT.items():
+            if any(r.get("name") == nm for r in rows):
+                print(f"    {nm} — {why}")
+    rows = [r for r in rows if r.get("name") not in EXEMPT]
     bad_order, bad_overlap, noinfo = [], [], 0
     for r in rows:
         v = (r.get("val_cutoff") or "").strip()
