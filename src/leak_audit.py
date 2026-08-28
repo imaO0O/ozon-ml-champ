@@ -46,6 +46,8 @@ import polars as pl
 from config import DATA_START, HORIZON, MODELS, TEST_CUTOFF
 
 LOG = MODELS / "experiments.csv"
+# Путь ВНУТРИ репозитория: `git show ref:path` абсолютный не принимает.
+LOG_IN_REPO = "models/experiments.csv"
 
 
 def check_tabular(cutoff: dt.date) -> bool:
@@ -98,9 +100,36 @@ def check_seq(cutoffs: list[dt.date], lookback: int, sample: int) -> bool:
     return ok
 
 
-def check_cutoff_order() -> bool:
-    """Журнал прогонов: окно цели обучения не достаёт до валидационного среза."""
+def journal_rows(refs: list[str]) -> list[dict]:
+    """Строки журнала из рабочего дерева ПЛЮС из указанных веток.
+
+    Зачем ветки. Половина команды работает в своей ветке, и её прогоны
+    попадают в main не сразу. Аудит только по `main` покрывает не всю работу
+    команды, а её ствол — и утверждение «ни один прогон за всю историю»
+    оказывается шире измерения. Именно так и вышло 28.08: 82 прогона трека C
+    жили в `track-c-self-norm` и в аудит не входили, хотя документы жюри
+    ссылались на их числа.
+    """
+    import subprocess  # noqa: PLC0415  (нужен только здесь)
+
     rows = list(csv.DictReader(io.open(LOG, encoding="utf-8")))
+    seen = {(r.get("name"), r.get("val_cutoff"), r.get("rmsle_single")) for r in rows}
+    for ref in refs:
+        r = subprocess.run(["git", "show", f"{ref}:{LOG_IN_REPO}"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"  ветка {ref} недоступна, пропущена")
+            continue
+        extra = [x for x in csv.DictReader(io.StringIO(r.stdout))
+                 if (x.get("name"), x.get("val_cutoff"), x.get("rmsle_single")) not in seen]
+        print(f"  из {ref}: +{len(extra)} прогонов, которых нет в рабочем дереве")
+        rows += extra
+    return rows
+
+
+def check_cutoff_order(refs: list[str]) -> bool:
+    """Журнал прогонов: окно цели обучения не достаёт до валидационного среза."""
+    rows = journal_rows(refs)
     bad_order, bad_overlap, noinfo = [], [], 0
     for r in rows:
         v = (r.get("val_cutoff") or "").strip()
@@ -135,6 +164,9 @@ def main() -> None:
                     help="сколько пользователей брать в проверке тензора")
     ap.add_argument("--skip-tab", action="store_true")
     ap.add_argument("--skip-seq", action="store_true")
+    ap.add_argument("--refs", default="origin/track-c-self-norm",
+                    help="ветки, чьи журналы тоже проверить (через запятую); "
+                         "работа второй половины команды живёт вне main")
     args = ap.parse_args()
 
     cut = dt.date.fromisoformat(args.cutoff)
@@ -148,7 +180,8 @@ def main() -> None:
         results["вход сетей"] = check_seq(
             [cut, cut - dt.timedelta(days=HORIZON), TEST_CUTOFF], args.lookback, args.sample)
     print("\n--- 3. порядок срезов во всех прогонах журнала ---")
-    results["порядок срезов"] = check_cutoff_order()
+    results["порядок срезов"] = check_cutoff_order(
+        [r.strip() for r in args.refs.split(",") if r.strip()])
 
     print("\n=== ИТОГ ===")
     for k, v in results.items():
