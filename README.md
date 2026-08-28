@@ -164,7 +164,7 @@ python -u src/ensemble.py --val-cutoffs 2026-01-15,2025-12-16 --members mixed
 ```bash
 python -u src/train.py --cutoffs 6 --ensemble --save-val-pred --name my_ens
 python -u src/compose.py --a models/my_ens_valpred_2026-01-15.npz --b models/<чужой>_2026-01-15.npz --wb 0.542
-python -u src/net_value.py --names <сеть>          # потолок пользы от чужих предсказаний
+python -u src/net_value.py --base <работающая> --new <проверяемая>   # потолок пользы от чужих предсказаний
 python -u src/blend_opt.py --a A.csv --mse-a <RMSLE> --b B.csv --mse-b <RMSLE> --out blend.csv
 ```
 
