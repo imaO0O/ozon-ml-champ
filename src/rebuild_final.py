@@ -65,7 +65,26 @@ SEED_AVERAGES = {
 
 
 def load(name: str) -> tuple[np.ndarray, np.ndarray]:
-    d = pl.read_csv(SUBMISSIONS / f"{name}.csv").sort("user_id")
+    """Компонента из `submissions/`. Внятный отказ, если её нет.
+
+    Файлов предсказаний в репозитории НЕТ и быть не должно: это готовые
+    ответы, и `.gitignore` исключает `submissions/*` кроме журнала. Поэтому
+    сразу после `git clone` этот скрипт запустить нельзя — сначала конвейер
+    порождает компоненты (README, раздел про полный прогон), и только потом
+    сверка имеет смысл.
+
+    Без этой проверки первым, что видит человек со свежим клоном, был бы
+    FileNotFoundError из недр polars — и вывод «репозиторий сломан» вместо
+    «компоненты надо сперва собрать».
+    """
+    path = SUBMISSIONS / f"{name}.csv"
+    if not path.exists():
+        raise SystemExit(
+            f"нет компоненты {path.name}.\n"
+            "Файлы предсказаний намеренно не хранятся в репозитории (готовые\n"
+            "ответы соревнования, см. .gitignore). Сначала соберите компоненты\n"
+            "конвейером из README, затем запускайте пересборку.")
+    d = pl.read_csv(path).sort("user_id")
     return d["user_id"].to_numpy(), np.log1p(d["predict"].to_numpy())
 
 
