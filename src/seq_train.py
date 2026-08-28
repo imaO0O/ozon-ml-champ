@@ -498,7 +498,8 @@ def load_static(cutoff: dt.date, users: np.ndarray, rows: np.ndarray,
 
 def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
                   sample: int = 20000, seed: int = SEED, bin_days: int = 1,
-                  events: int = 0, norm: bool = False, no_ranks: bool = False):
+                  events: int = 0, norm: bool = False, no_ranks: bool = False,
+                  multi: int = 0):
     """Среднее и разброс по каналам на выборке окон — только по обучающим срезам.
 
     Считать по всем данным нельзя: в выборку попал бы валидационный срез.
@@ -512,7 +513,7 @@ def channel_stats(seq, rows: np.ndarray, cutoff: dt.date, lookback: int,
     sel = np.sort(rng.choice(rows, size=min(sample, len(rows)), replace=False))
     n_data = len(CHANNELS) - (len(RANK_CHANNELS) if no_ranks else 0)
     x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events,
-                    norm, no_ranks)[:, :, :n_data]
+                    norm, no_ranks, multi)[:, :, :n_data]
     mean = x.mean(axis=(0, 1))
     std = x.std(axis=(0, 1))
     std[std < 1e-6] = 1.0
@@ -560,8 +561,42 @@ def drop_day_ranks(x: np.ndarray) -> np.ndarray:
     return np.concatenate([x[:, :, :keep], x[:, :, len(CHANNELS):]], axis=2)
 
 
+def multi_window(x: np.ndarray, fine: int, bin_days: int) -> np.ndarray:
+    """МНОГОМАСШТАБНОЕ окно: далёкое прошлое крупно, недавнее — по дням.
+
+    Зачем это отдельное представление, а не ещё одна рука состава. У нас уже
+    есть годовая сеть (364 дня недельным шагом) и дневная (90 дней), и они
+    соединены ВЕСОМ. Линейная смесь двух предсказаний не может выразить
+    взаимодействие масштабов: «клиент, у которого годовой уровень высок,
+    А последняя неделя пуста» — это не сумма двух признаков. Одна сеть,
+    видящая оба разрешения сразу, такое выражает.
+
+    По нашему закону это разрешённое направление: меняется ВХОД (сеть видит
+    больше), а не форма гипотез. Формы мы уже перебрали и получили ноль трижды
+    (другие потери, табличная сеть, сеть остатка).
+
+    Устройство: последние `fine` дней остаются дневными, всё, что старше,
+    сворачивается шагом `bin_days`. При lookback 364, fine 91 и шаге 7 выходит
+    39 недельных шагов плюс 91 дневной = 130 шагов против 52 у годовой сети
+    и 90 у дневной.
+
+    Отдельный канал-маркер разрешения НЕ добавляется намеренно. Граница всегда
+    на одном и том же индексе, и рекуррентная сеть её выучивает по положению;
+    добавление канала было бы вторым изменением в одном замере, а мы меняем
+    одно за раз (правило, которым уже поймали три перепутанных прогона).
+    """
+    n, t, c = x.shape
+    if fine >= t:
+        return x
+    old, new = x[:, :t - fine], x[:, t - fine:]
+    if (t - fine) % bin_days:
+        raise SystemExit(f"старая часть окна {t - fine} не делится на шаг {bin_days}")
+    return np.concatenate([bin_window(old, bin_days), new], axis=1)
+
+
 def prep_window(x: np.ndarray, bin_days: int, events: int,
-                norm: bool = False, no_ranks: bool = False) -> np.ndarray:
+                norm: bool = False, no_ranks: bool = False,
+                multi: int = 0) -> np.ndarray:
     """Представление окна: дневная сетка, укрупнённые шаги или события.
 
     Взаимоисключающие ветки — оба преобразования читают ось дней, и применять
@@ -574,8 +609,16 @@ def prep_window(x: np.ndarray, bin_days: int, events: int,
         x = self_norm(x)
     if no_ranks:
         x = drop_day_ranks(x)
+    if events and multi:
+        # Молчаливое взаимоисключение — тот самый класс, из-за которого
+        # --self-norm однажды попал только в обучающие батчи: прогон
+        # не падает и выдаёт правдоподобное число не про то.
+        raise SystemExit("--multi и --events взаимоисключающи: оба задают "
+                         "представление оси времени")
     if events:
         return events_window(x, events)
+    if multi:
+        return multi_window(x, multi, bin_days)
     return bin_window(x, bin_days)
 
 
@@ -589,14 +632,14 @@ def batches(seq, rows: np.ndarray, cutoff: dt.date, lookback: int, batch_size: i
             y: np.ndarray | None = None, shuffle: bool = False, rng=None,
             bin_days: int = 1, static: np.ndarray | None = None,
             aux: np.ndarray | None = None, events: int = 0, norm: bool = False,
-            no_ranks: bool = False):
+            no_ranks: bool = False, multi: int = 0):
     """Батчи окон. Индексы внутри батча сортируются — memmap читается локальнее."""
     order = rng.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for i in range(0, len(order), batch_size):
         take = np.sort(order[i:i + batch_size])
         sel = rows[take]
         x = prep_window(gather(seq, sel, cutoff, lookback), bin_days, events, norm,
-                        no_ranks)
+                        no_ranks, multi)
         s = None if static is None else static[take]
         a = None if aux is None else aux[take]
         yield x, s, (None if y is None else y[take]), a, take
@@ -769,7 +812,7 @@ class SeqNet(nn.Module):
 
 def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, y=None,
              desc: str = "предсказание", bin_days: int = 1, static=None, events: int = 0,
-             norm: bool = False, no_ranks: bool = False):
+             norm: bool = False, no_ranks: bool = False, multi: int = 0):
     """Предсказания в log1p-шкале (без обрезки — обрезает метрика, как лидерборд)."""
     model.eval()
     out = np.empty(len(rows), dtype=np.float64)
@@ -777,7 +820,8 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
                                         bin_days=bin_days, static=static, events=events,
-                                        norm=norm, no_ranks=no_ranks):
+                                        norm=norm, no_ranks=no_ranks,
+                                        multi=multi):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
@@ -792,7 +836,8 @@ def evaluate(model, seq, rows, cutoff, lookback, batch_size, mean, std, device, 
 
 def evaluate_proba(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
                    bin_days: int = 1, static=None, events: int = 0,
-                   norm: bool = False, no_ranks: bool = False) -> np.ndarray:
+                   norm: bool = False, no_ranks: bool = False,
+                   multi: int = 0) -> np.ndarray:
     """Само распределение по бинам, а не только его среднее.
 
     Нужно для вероятностной части: `P(y = 0)` — это вероятность нулевого бина,
@@ -812,7 +857,8 @@ def evaluate_proba(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
     with torch.no_grad():
         for x, s, _, _, take in batches(seq, rows, cutoff, lookback, batch_size,
                                         bin_days=bin_days, static=static, events=events,
-                                        norm=norm, no_ranks=no_ranks):
+                                        norm=norm, no_ranks=no_ranks,
+                                        multi=multi):
             xb = to_device(x, mean, std, device)
             sb = None if s is None else torch.from_numpy(s).float().to(device)
             with autocast(device):
@@ -825,7 +871,8 @@ def evaluate_proba(model, seq, rows, cutoff, lookback, batch_size, mean, std, de
 
 def extract_hidden(model, seq, rows, cutoff, lookback, batch_size, mean, std, device,
                    bin_days: int = 1, static=None, events: int = 0,
-                   norm: bool = False, no_ranks: bool = False) -> np.ndarray:
+                   norm: bool = False, no_ranks: bool = False,
+                   multi: int = 0) -> np.ndarray:
     """Скрытые состояния для всех строк — матрица (len(rows), hidden).
 
     Хранится во float16: точность здесь не критична (бустинг всё равно режет
@@ -881,7 +928,8 @@ def win_kw(args) -> dict:
     Прогон при этом не падает и выдаёт правдоподобное число.
     """
     return {"bin_days": args.bin, "events": args.events,
-            "norm": args.self_norm, "no_ranks": args.no_day_ranks}
+            "norm": args.self_norm, "no_ranks": args.no_day_ranks,
+            "multi": args.multi}
 
 
 def to_device(x: np.ndarray, mean, std, device) -> torch.Tensor:
@@ -909,7 +957,11 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
     итераций фиксируется заранее).
     """
     torch.manual_seed(args.seed)
-    steps = args.events or args.lookback // args.bin
+    # Число шагов задаёт форму входа модели, поэтому многомасштабное окно
+    # обязано учитываться здесь, а не только в сообщении.
+    steps = args.events or (
+        (args.lookback - args.multi) // args.bin + args.multi if args.multi
+        else args.lookback // args.bin)
     n_ch = n_input_channels(args.events, args.no_day_ranks)
     n_static = 0 if train_static is None else train_static[0].shape[1]
     n_aux = 0 if train_aux is None else train_aux[0].shape[1]
@@ -932,8 +984,16 @@ def train_model(seq, train_rows, train_y, train_cuts, val_rows, val_y, val_cut, 
               f"{share0:.1%} обучающих таргетов | центры от {centers[1]:.3f} "
               f"до {centers[-1]:.3f}")
     n_par = sum(p.numel() for p in model.parameters())
-    shape = (f"= {steps} событий из {args.lookback} дней" if args.events
-             else f"= {steps} шагов по {args.bin} дн.")
+    if args.events:
+        shape = f"= {steps} событий из {args.lookback} дней"
+    elif args.multi:
+        # Сообщение обязано отражать РЕАЛЬНОЕ представление: строка «52 шага
+        # по 7 дн.» при многомасштабном окне была бы ложью в журнале прогона.
+        coarse = (args.lookback - args.multi) // args.bin
+        shape = (f"= {coarse} шагов по {args.bin} дн. + {args.multi} дневных "
+                 f"= {steps} шагов (многомасштабное)")
+    else:
+        shape = f"= {steps} шагов по {args.bin} дн."
     print(f"{args.arch}: {n_par:,} параметров | окно {args.lookback} дней "
           f"{shape} | {n_ch} каналов"
           f"{f' + {n_static} рангов' if n_static else ''}"
@@ -1082,7 +1142,11 @@ def predict_empty(model, args, mean, std, device) -> float:
     токена, все `valid` нулевые. Это ровно тот вход, который событийное
     представление и обязано отдавать в этом случае, — добивать его нечем.
     """
-    steps = args.events or args.lookback // args.bin
+    # Число шагов задаёт форму входа модели, поэтому многомасштабное окно
+    # обязано учитываться здесь, а не только в сообщении.
+    steps = args.events or (
+        (args.lookback - args.multi) // args.bin + args.multi if args.multi
+        else args.lookback // args.bin)
     n_ch = n_input_channels(args.events, args.no_day_ranks)
     x = np.zeros((1, steps, n_ch), dtype=np.float32)
     if not args.events:
@@ -1166,6 +1230,11 @@ def main() -> None:
                     help="сколько дней в одном шаге последовательности: 1 — по дням, "
                          "7 — по неделям (180 дней превращаются в 26 плотных шагов). "
                          "Длина окна должна делиться на это число")
+    ap.add_argument("--multi", type=int, default=0,
+                    help="МНОГОМАСШТАБНОЕ окно: сколько последних дней оставить "
+                         "дневными, остальное свернуть шагом --bin. "
+                         "Пример: --lookback 364 --bin 7 --multi 91 -> "
+                         "39 недельных шагов + 91 дневной")
     ap.add_argument("--events", type=int, default=0,
                     help="событийное представление: сколько последних активных дней "
                          "подавать токенами вместо дневной сетки (0 — сетка). "
