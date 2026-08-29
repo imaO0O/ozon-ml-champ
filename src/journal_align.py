@@ -58,6 +58,23 @@
 Совпало — файл принадлежит строке. Не совпало — строка остаётся пустой
 и попадает в отчёт. Пустая клетка честнее правдоподобного числа.
 
+## Почему запись сделана с защитой от гонки
+
+Добавить колонку нельзя иначе, как переписав файл целиком, — а журнал общий,
+и в него дописывают строки пять скриптов, в том числе долгий `seq_oof_net.py`,
+который добавляет строку после каждой сети. Запись поверх дописывания теряет
+чужую строку молча.
+
+Поэтому: содержимое хешируется при чтении и перечитывается прямо перед
+записью; если хеш изменился, значит кто-то дописал, и заполнение делается
+заново на свежем содержимом (замеры кешированы, это мгновенно). Сама запись
+идёт во временный файл и подменяется `os.replace` — атомарно, то есть
+оборванный процесс не оставит обрезанного журнала.
+
+Дефект нашёл трек C до того, как он что-то стоил: отказался писать поверх
+идущего прогона OOF, сославшись на прежний инцидент с восстановлением
+`log.csv` из HEAD.
+
     python -u src/journal_align.py            # только отчёт
     python -u src/journal_align.py --write    # заполнить колонку
 """
@@ -65,6 +82,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import io
+import os
 
 import numpy as np
 
@@ -98,19 +118,33 @@ def measure(path) -> "tuple[float, float, float, bool]":
     return rmse_log(y, p), ali, gini, abs(p.mean() - y.mean()) < EPS_LEVEL
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true", help="записать колонку в журнал")
-    ap.add_argument("--show", type=int, default=12, help="сколько расхождений печатать")
-    args = ap.parse_args()
-
-    with open(LOG, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        fields = list(reader.fieldnames or [])
-        rows = list(reader)
+def read_log() -> "tuple[str, list[str], list[dict]]":
+    """Содержимое журнала вместе с хешем — чтобы заметить чужую дозапись."""
+    raw = LOG.read_bytes()
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
+    rows = list(reader)
+    fields = list(reader.fieldnames or [])
     if COL not in fields:
         fields.append(COL)
+    return hashlib.sha256(raw).hexdigest(), fields, rows
 
+
+def write_log(fields: list[str], rows: list[dict]) -> None:
+    """Запись через временный файл: оборванный процесс не оставит обрезка."""
+    tmp = LOG.with_name(LOG.name + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, LOG)
+
+
+def fill(rows: list[dict], memo: dict) -> dict:
+    """Проставить колонку во все строки, где привязка проверяется.
+
+    Замеры кешируются в `memo`: повтор на свежепрочитанном журнале обходится
+    без единого обращения к диску, и окно гонки при перезаписи почти нулевое.
+    """
     filled = already = nofile = mismatch = by_gini = 0
     gaps, bad = [], []
     for r in rows:
@@ -126,7 +160,9 @@ def main() -> None:
         if not path.exists():
             nofile += 1
             continue
-        raw, ali, gini, prealigned = measure(path)
+        if path not in memo:
+            memo[path] = measure(path)
+        raw, ali, gini, prealigned = memo[path]
         if prealigned:
             # Сырой величины в таком файле нет вовсе, сверять RMSLE не с чем.
             g_j = (r.get("gini_blend") or "").strip()
@@ -154,6 +190,22 @@ def main() -> None:
         dup.setdefault(((r.get("name") or "").strip(), (r.get("val_cutoff") or "").strip()),
                        []).append(r)
     ambiguous = {k: v for k, v in dup.items() if len(v) > 1 and k[0] and k[1]}
+    return {"filled": filled, "already": already, "nofile": nofile, "mismatch": mismatch,
+            "by_gini": by_gini, "gaps": gaps, "bad": bad, "ambiguous": ambiguous}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write", action="store_true", help="записать колонку в журнал")
+    ap.add_argument("--show", type=int, default=12, help="сколько расхождений печатать")
+    args = ap.parse_args()
+
+    memo: dict = {}
+    digest, fields, rows = read_log()
+    st = fill(rows, memo)
+    filled, already, nofile = st["filled"], st["already"], st["nofile"]
+    mismatch, by_gini = st["mismatch"], st["by_gini"]
+    gaps, bad, ambiguous = st["gaps"], st["bad"], st["ambiguous"]
 
     print(f"строк в журнале {len(rows)}")
     print(f"  заполнено сейчас        {filled}")
@@ -185,14 +237,25 @@ def main() -> None:
         print(f"\n  разрыв больше 0.001: {big} из {len(gaps)} — "
               "столько строк сравнивать по сырой нельзя")
 
-    if args.write:
-        with open(LOG, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows(rows)
-        print(f"\nжурнал переписан, колонка {COL} заполнена в {filled} строках")
-    else:
+    if not args.write:
         print("\nотчёт; чтобы записать — --write")
+        return
+
+    # Перечитать, заполнить заново и убедиться, что за это время файл не
+    # изменился. Порядок именно такой: пишется ровно то содержимое, чей хеш
+    # только что проверен, иначе чужая дописанная строка пропала бы молча.
+    for attempt in range(1, 4):
+        digest, fields, rows = read_log()
+        filled = fill(rows, memo)["filled"]
+        if hashlib.sha256(LOG.read_bytes()).hexdigest() == digest:
+            write_log(fields, rows)
+            print(f"\nжурнал переписан, колонка {COL} заполнена в {filled} строках")
+            return
+        print(f"\nжурнал дописали, пока шёл счёт (попытка {attempt}) — перечитываю")
+    raise SystemExit(
+        "журнал переписывают прямо сейчас — запись отменена, ничего не потеряно.\n"
+        "Дождитесь конца чужого прогона (обычно это seq_oof_net.py, он пишет "
+        "строку после каждой сети) и повторите.")
 
 
 if __name__ == "__main__":
