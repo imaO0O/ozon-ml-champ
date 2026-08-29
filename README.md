@@ -326,9 +326,13 @@ python -u src/seq_data.py        # ОБЯЗАТЕЛЬНО ПЕРВЫМ: матр
 
 ```bash
 # 1. Сеть под стекинг: 90 дней дневным шагом. Идёт признаком в бустинг.
+# Имя b64a, а не b64: набор b64 сделан 20.08, ДО починки ранней остановки,
+# и его сети обрывались на 2-4 эпохе из двадцати. Стекинг в составе стоит
+# на b64a (проверено по lgbm_stk2_meta.json: net_b64a_rank, net_b64a_centered).
+# До 29.08 здесь стояло b64 — инструкция воспроизводила выбывшую конфигурацию.
 python -u src/seq_train.py --lookback 90 --arch gru --static rk_ --bins 64
-python -u src/seq_oof_net.py --lookback 90 --static rk_ --bins 64 --seeds 42,13,7 --name netoof_b64
-python -u src/train.py --cutoffs 6 --ensemble --net --net-names b64 --final --name lgbm_stk
+python -u src/seq_oof_net.py --lookback 90 --static rk_ --bins 64 --seeds 42,13,7 --name netoof_b64a
+python -u src/train.py --cutoffs 6 --ensemble --net --net-names b64a --final --name lgbm_stk
 
 # 2. ГОДОВАЯ сеть: 364 дня недельным шагом. Главный вклад состава.
 python -u src/seq_train.py --lookback 364 --bin 7 --static rk_ --bins 64 --seed 42 --name yearfin_s42
