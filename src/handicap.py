@@ -174,11 +174,23 @@ def main() -> None:
         print(line + f"{it:>7}")
         rows.append((tag, a, it, p, cols))
 
+    def safe_tag(tag: str) -> str:
+        """Имя строки журнала и имя файла обязаны строиться ОДНИМ правилом.
+
+        Строилось разными: строка журнала брала последнее слово тега, файл —
+        весь тег без кавычек. Теги «без короткие окна» и «без длинные окна»
+        кончаются одинаково, и два разных опыта легли в журнал под одним
+        именем `hcap_окна»`, различаясь только числом (1.68360 и 1.68469).
+        Файлы при этом остались разными — то есть по журналу прогон было
+        уже не восстановить, а по диску ещё можно.
+        """
+        return tag.replace("«", "").replace("»", "").replace(" ", "_")
+
     for tag, a, it, p, cols in rows:
         append_csv(LOG, FIELDS, {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": git_commit(), "feat_ver": features_version(),
-            "blocks": args.blocks or "all", "name": f"{args.name}_{tag.split()[-1]}",
+            "blocks": args.blocks or "all", "name": f"{args.name}_{safe_tag(tag)}",
             "model": "lgbm", "cutoffs": len(train_cuts), "n_features": len(cols),
             "rmsle_single": round(float(rmse_log(y, p)), 5),
             "rmsle_blend": round(float(rmse_log(y, p)), 5),
@@ -188,8 +200,7 @@ def main() -> None:
             "note": f"{args.note} [урезанный бустинг: {tag}, выровненный {a:.5f}]",
         })
     for tag, a, it, p, cols in rows:
-        safe = tag.replace("«", "").replace("»", "").replace(" ", "_")
-        np.savez_compressed(MODELS / f"{args.name}_{safe}_valpred_{val_cut}.npz",
+        np.savez_compressed(MODELS / f"{args.name}_{safe_tag(tag)}_valpred_{val_cut}.npz",
                             user_id=ids[order], pred_log=p[order], target=yv[order])
     print(f"\nзаписано в {LOG}, предсказания сохранены")
 

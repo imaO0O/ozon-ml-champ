@@ -143,12 +143,31 @@ def main() -> None:
         filled += 1
         gaps.append((float(raw_j) - ali, name, cut, float(raw_j), ali))
 
+    # Один файл предсказаний на несколько строк с тем же именем и срезом —
+    # привязка неоднозначна в принципе. Так вышло после прогона трека B:
+    # его строка и наша легли рядом под одним именем и одним срезом, а колонки,
+    # различающей машину, в журнале нет (устройство пишется в `note` текстом).
+    # Сверка чисел развела их — но только потому, что железо разное; на одной
+    # машине два прогона совпали бы, и различить их стало бы нечем.
+    dup: dict[tuple, list] = {}
+    for r in rows:
+        dup.setdefault(((r.get("name") or "").strip(), (r.get("val_cutoff") or "").strip()),
+                       []).append(r)
+    ambiguous = {k: v for k, v in dup.items() if len(v) > 1 and k[0] and k[1]}
+
     print(f"строк в журнале {len(rows)}")
     print(f"  заполнено сейчас        {filled}")
     print(f"  уже было заполнено      {already}")
     print(f"  нет файла предсказаний  {nofile}")
     print(f"  из них по Gini          {by_gini}  (файл сохранён уже выровненным)")
     print(f"  файл есть, но НЕ ТОТ    {mismatch}  (проверка не сошлась — не приписываем)")
+
+    if ambiguous:
+        print(f"\n--- одно имя + один срез в нескольких строках: {len(ambiguous)} ---")
+        print("  привязка держится только на том, что числа разошлись")
+        for (n, c), v in sorted(ambiguous.items())[:args.show]:
+            nums = ", ".join(sorted({(x.get("rmsle_single") or "?") for x in v}))
+            print(f"  {n:<28} {c}  строк {len(v)}  числа: {nums}")
 
     if bad:
         print(f"\n--- привязка отвергнута (первые {args.show}) ---")

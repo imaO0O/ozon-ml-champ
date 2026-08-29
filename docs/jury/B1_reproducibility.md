@@ -283,23 +283,37 @@ cutoff'а, и горизонт читается у каждого среза с�
 
     ```bash
     # 1. под стекинг: 90 дней дневным шагом, идёт признаком в бустинг
-    python -u src/seq_train.py --lookback 90 --static rk_ --bins 64
-    python -u src/seq_oof_net.py --lookback 90 --static rk_ --bins 64 --seeds 42,13,7 --name netoof_b64
-    python -u src/train.py --cutoffs 6 --ensemble --net --net-names b64 --final --name lgbm_stk
+    python -u src/seq_train.py --lookback 90 --static rk_ --bins 64 --name b64a_check
+    python -u src/seq_oof_net.py --lookback 90 --static rk_ --bins 64 --seeds 42,13,7 --name netoof_b64a_check
+    python -u src/train.py --cutoffs 6 --ensemble --net --net-names b64a --final --name lgbm_stk_check
 
     # 2. годовая: 364 дня недельным шагом, сиды 42/13/7/3 -> yearfin_avg4
-    python -u src/seq_train.py --lookback 364 --bin 7 --static rk_ --bins 64 --seed 42 --name yearfin_s42
+    python -u src/seq_train.py --lookback 364 --bin 7 --static rk_ --bins 64 --seed 42 --name yearfin_check
 
     # 3. без статических рангов: флага --static нет намеренно, сиды 42/13/7/3
-    python -u src/seq_train.py --lookback 90 --bins 64 --seed 42 --name nostfin
+    python -u src/seq_train.py --lookback 90 --bins 64 --seed 42 --name nostfin_check
 
     # 4. событийная: 96 событий вместо календарной сетки, сиды 42/13/7
-    python -u src/seq_train.py --lookback 364 --events 96 --static rk_ --bins 64 --seed 42 --name evfin
+    python -u src/seq_train.py --lookback 364 --events 96 --static rk_ --bins 64 --seed 42 --name evfin_check
     ```
 
+    **Суффикс `_check` во всех четырёх именах обязателен, и вот почему.**
+    Прогон трека B 29.08 положил в журнал строки с теми же именами и теми же
+    срезами, что и наши, а колонки, различающей машину, в журнале нет —
+    устройство пишется в `note` текстом (`[cuda/bf16 seed=42]` в обеих
+    строках). Развести их удалось только потому, что железо разное и числа
+    разошлись; на одинаковых картах два прогона совпали бы, и различить
+    их стало бы нечем. Сейчас в журнале **37 групп «имя + срез» из нескольких
+    строк**, и у `dist_ctl_s42` обе несут одно и то же число.
+    `python -u src/journal_align.py` печатает этот список.
+
     Ориентиры на январе, **сырой** RMSLE (как печатает сеть): годовая 1.68202
-    (выровненный 1.66785), событийная 1.67452, без рангов 1.71160; OOF
-    по семи срезам — 2 ч 10 мин на RTX 5070.
+    (выровненный 1.66785), событийная 1.67452 (выровненный 1.66741),
+    без рангов 1.71160 (выровненный 1.70418); OOF по семи срезам — 2 ч 10 мин
+    на RTX 5070. **Сверять выровненную**: у трека B по сырой два прогона из пяти
+    получили бы неверный вердикт — декабрь ложно превысил бы порог (−0.00233
+    против −0.00083), а январская рука `b64a` разошлась бы впятеро
+    (+0.00494 против −0.00046).
 
     **Эталон конфигурации — колонка `feat_ver` в `models/experiments.csv`,
     а не этот текст.** `seq18x364b7` = 18 каналов, окно 364, шаг 7;
