@@ -6,12 +6,13 @@
 `net_value.py --names`, которой у скрипта нет. Ни один не виден при чтении —
 текст всюду выглядит осмысленным. Все три видны сверкой с источником истины.
 
-Источников истины два, и оба машинные:
+Источников истины три, и все машинные:
 
 * `submissions/log.csv` — что реально отправлялось и какой счёт получило;
-* вывод `--help` каждого скрипта — какие флаги существуют на самом деле.
+* вывод `--help` каждого скрипта — какие флаги существуют на самом деле;
+* `models/experiments.csv` — какие прогоны были и на какой версии признаков.
 
-Отсюда две проверки.
+Отсюда три проверки.
 
 **1. Числа.** Все величины вида `1.6xxxxx` в документах жюри сверяются
 со счетами лидерборда. Совпадение не требуется: большинство таких чисел —
@@ -19,6 +20,19 @@
 **объяснимость**: скрипт печатает несовпавшие, чтобы человек посмотрел
 на каждое и сказал, откуда оно. Именно так нашлось, что 1.67265 принадлежит
 сети-предшественнице.
+
+**3. Ссылки на журнал прогонов.** Документ, называющий прогон по имени
+и приводящий его число, обязан указывать на **действующую** строку. Дефект,
+который эта проверка ловит, найден треком B 29.08: чек-лист воспроизводимости
+велел сверяться со строкой `lgbm_ens` (1.68402) — версией признаков
+`e0184ed7`, выбывшей 11.08. Прогон честно дал 1.68209, расхождение вдвое выше
+порога, и читатель объявил бы репозиторий невоспроизводимым.
+
+Имя прогон не идентифицирует: `lgbm_ens` стоит в журнале трижды на трёх
+версиях признаков. Поэтому проверка ищет сочетание, которое законным
+не бывает: имя есть в журнале, число совпало с **устаревшей** строкой,
+а у более поздней строки того же имени число другое. Это ссылка на выбывший
+артефакт, и вердикт здесь однозначен, как у команд.
 
 **2. Команды.** Из документов вынимаются все строки `python -u src/*.py ...`,
 и каждый флаг сверяется с выводом `--help` того самого скрипта. Здесь
@@ -52,6 +66,11 @@ DOC_NUM = sorted(pathlib.Path("docs/jury").glob("*.md")) + [pathlib.Path("README
 DOC_CMD = DOC_NUM + [pathlib.Path("TASKS.md"), pathlib.Path("PLAN.md")]
 
 NUM_RE = re.compile(r"\b1\.6[0-9]{3,7}\b")
+JOURNAL = pathlib.Path("models/experiments.csv")
+# `имя` ... число — в пределах одной-двух строк текста; дальше связь между
+# именем и числом уже не гарантирована, и проверка начала бы выдумывать.
+REF_RE = re.compile(r"`([a-z][a-z0-9_]{2,})`(?:[^\n]|\n(?!\n)){0,120}?\b(1\.[0-9]{4,5})\b")
+MARK = "<!-- выбывшая строка приведена намеренно -->"
 CMD_RE = re.compile(r"python -u (src/[a-z_]+\.py)([^\n`]*)")
 FLAG_RE = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
 
@@ -101,6 +120,60 @@ def check_numbers(quiet: bool) -> None:
             print(f"    {f}:{l}  {x}\n        {ctx}")
 
 
+def check_journal_refs() -> bool:
+    """Ссылки документов на строки журнала прогонов: не выбыла ли строка."""
+    if not JOURNAL.exists():
+        print("  журнала прогонов нет, проверка пропущена")
+        return True
+    runs: dict[str, list[dict]] = {}
+    for r in csv.DictReader(io.open(JOURNAL, encoding="utf-8")):
+        runs.setdefault((r.get("name") or "").strip(), []).append(r)
+
+    def values(row: dict) -> set[str]:
+        out = set()
+        for c in ("rmsle_single", "rmsle_two_stage", "rmsle_blend", "rmsle_aligned"):
+            v = (row.get(c) or "").strip()
+            if v:
+                out.add(v)
+        return out
+
+    stale, checked = [], 0
+    for d in DOC_NUM:
+        t = io.open(d, encoding="utf-8").read()
+        for m in REF_RE.finditer(t):
+            name, num = m.group(1), m.group(2)
+            rows = runs.get(name)
+            if not rows:
+                continue
+            checked += 1
+            hit = [r for r in rows if any(v.startswith(num) or num.startswith(v)
+                                          for v in values(r))]
+            if not hit or len(rows) == 1:
+                continue
+            newest = max(rows, key=lambda r: r.get("created") or "")
+            if newest in hit:
+                continue
+            # Число принадлежит не самой поздней строке этого имени, и у поздней
+            # оно другое: документ показывает на выбывший прогон.
+            line = t[:m.start()].count("\n") + 1
+            # Разбор собственной ошибки обязан привести выбывшее число целиком,
+            # иначе рассказывать не о чем. Исключение помечается в тексте
+            # и потому видно человеку, а не спрятано в списке внутри скрипта.
+            para = t[t.rfind("\n\n", 0, m.start()) + 2:
+                     (t.find("\n\n", m.end()) + 1 or len(t))]
+            if MARK in para:
+                continue
+            stale.append((d.name, line, name, num,
+                          (hit[0].get("feat_ver") or "?"), (newest.get("feat_ver") or "?"),
+                          sorted(values(newest))[:1]))
+    print(f"  ссылок «имя + число» с известным прогоном: {checked} | "
+          f"устаревших: {len(stale)}")
+    for f, l, n, num, old_v, new_v, cur in stale:
+        print(f"    {f}:{l}  `{n}` {num} — версия признаков {old_v} выбыла; "
+              f"действующая {new_v}" + (f", число {cur[0]}" if cur else ""))
+    return not stale
+
+
 def check_commands() -> bool:
     bad, total = [], 0
     for d in DOC_CMD:
@@ -134,9 +207,13 @@ def main() -> None:
     check_numbers(args.quiet)
     print("\n--- 2. команды документов против --help скриптов ---")
     ok = check_commands()
+    print("\n--- 3. ссылки документов на строки журнала прогонов ---")
+    ok_refs = check_journal_refs()
     print("\n=== ИТОГ ===")
     print("  команды: " + ("все запускаются" if ok else "ЕСТЬ НЕЗАПУСКАЕМЫЕ"))
+    print("  ссылки на журнал: " + ("действующие" if ok_refs else "ЕСТЬ ВЫБЫВШИЕ"))
     print("  числа: вердикт за человеком, список выше сужает просмотр")
+    ok = ok and ok_refs
     if not ok:
         raise SystemExit("аудит документации НЕ пройден")
 

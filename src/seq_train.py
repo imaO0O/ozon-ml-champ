@@ -73,6 +73,13 @@ EXPERIMENT_FIELDS = [
     "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
     "gini_blend", "sum_bias_blend", "best_iter_single", "note", "val_cutoff",
     "train_cutoffs", "stride", "halflife",
+    # Выровненная величина ОТДЕЛЬНОЙ колонкой, а не вместо сырой. Уровень
+    # на сабмите правится бесплатно, поэтому сравнивать конфигурации надо
+    # по форме; у сетей сырая и выровненная расходятся до 0.021 и
+    # переставляют местами 29% пар. `append_csv` доберёт колонку пустой
+    # в старых строках — и пустая клетка честнее сырого числа в колонке
+    # сравнения: она прямо говорит, что строка для сверки не годится.
+    "rmsle_aligned",
 ]
 SUBMIT_FIELDS = ["file", "created", "commit", "name", "model", "blend_w", "val_rmsle",
                  "val_gini", "val_sum_err", "pred_sum", "pred_zeros", "lb_score", "note"]
@@ -1561,6 +1568,14 @@ def main() -> None:
         p_log = val_base + p_log
     res = report(val_y, np.expm1(np.clip(p_log, 0, None)),
                  args.arch + ("+бустинг" if val_base is not None else ""))
+    # Выровненная RMSLE: уровень предсказания сдвигается к уровню цели, и
+    # остаётся только форма. Ровно то, что метрика видит на лидерборде, где
+    # уровень тестового окна известен и правится константой. Свёртка та же,
+    # что в `compose.py`, чтобы число было сопоставимо с замерами направления.
+    y_log = np.log1p(val_y)
+    res["rmsle_aligned"] = rmse_log(y_log, p_log - p_log.mean() + y_log.mean())
+    print(f"{'выровнено':>14} | RMSLE {res['rmsle_aligned']:.5f} "
+          f"| уровень {p_log.mean() - y_log.mean():+.5f}")
 
     if args.save_val_pred:
         np.savez(MODELS / f"{args.name}_valpred_{val_cut}.npz",
@@ -1596,9 +1611,11 @@ def main() -> None:
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
         "n_features": n_input_channels(args.events, args.no_day_ranks),
         "rmsle_single": round(res["rmsle"], 5), "rmsle_two_stage": "",
-        # rmsle_blend дублирует rmsle_single: у сети одна голова, а команда
-        # сравнивает строки журнала именно по этой колонке.
+        # rmsle_blend дублирует rmsle_single: у сети одна голова. Колонкой
+        # сравнения она БЫЛА и потому осталась заполненной — но сравнивать
+        # по ней нельзя, для этого есть `rmsle_aligned`.
         "rmsle_blend": round(res["rmsle"], 5), "blend_w": "",
+        "rmsle_aligned": round(res["rmsle_aligned"], 5),
         "gini_blend": round(res["gini"], 4), "sum_bias_blend": round(res["sum_bias"], 4),
         "best_iter_single": best_epoch, "stride": 30, "halflife": "",
         "val_cutoff": str(val_cut), "train_cutoffs": " ".join(str(c) for c in train_cuts),
