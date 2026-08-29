@@ -69,7 +69,7 @@ from utils import append_csv, git_commit
 # лишних перезаписей в чужих коммитах.
 EXPERIMENT_FIELDS = [
     "created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
-    "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
+    "rmsle_single", "rmsle_two_stage", "rmsle_blend", "rmsle_aligned", "blend_w",
     "gini_blend", "sum_bias_blend", "best_iter_single", "note", "val_cutoff",
     "train_cutoffs", "stride", "halflife",
 ]
@@ -1266,6 +1266,13 @@ def main() -> None:
         p_log = val_base + p_log
     res = report(val_y, np.expm1(np.clip(p_log, 0, None)),
                  args.arch + ("+бустинг" if val_base is not None else ""))
+    # Выровненная величина считается здесь же и печатается рядом: уровень на
+    # сабмите правится бесплатным сдвигом, поэтому сравнивать модели между
+    # собой нужно именно по ней, а по эпохам печаталась только она.
+    _yl = np.log1p(val_y)
+    res_aligned = rmse_log(_yl, p_log - p_log.mean() + _yl.mean())
+    print(f"{'':>14} | выровненный RMSLE {res_aligned:.5f} "
+          f"(сырой {res['rmsle']:.5f}, разница {res['rmsle'] - res_aligned:+.5f})")
 
     if args.save_val_pred:
         np.savez(MODELS / f"{args.name}_valpred_{val_cut}.npz",
@@ -1291,6 +1298,13 @@ def main() -> None:
         "name": args.name, "model": args.arch, "cutoffs": len(train_cuts),
         "n_features": n_input_channels(args.events, args.no_day_ranks),
         "rmsle_single": round(res["rmsle"], 5), "rmsle_two_stage": "",
+        # Обе величины, и это не избыточность. Колонка rmsle_blend, по которой
+        # команда сравнивает строки, держит СЫРОЙ RMSLE, а по эпохам печатается
+        # ВЫРОВНЕННЫЙ. 28.08 это дало ложную находку: выровненное число нового
+        # прогона сравнили с журнальным сырым старого и получили +0.00669 там,
+        # где на одной основе -0.00917. Пока величина в журнале одна и не
+        # помечена, ошибка доступна любому.
+        "rmsle_aligned": round(res_aligned, 5),
         # rmsle_blend дублирует rmsle_single: у сети одна голова, а команда
         # сравнивает строки журнала именно по этой колонке.
         "rmsle_blend": round(res["rmsle"], 5), "blend_w": "",
