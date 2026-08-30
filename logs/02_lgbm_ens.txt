@@ -1,0 +1,57 @@
+train: 1,205,328 строк (5 cutoff) | val: 250,000 (2026-01-15)
+признаков: 242 | доля покупателей в val: 54.066%
+одноголовая модель — ансамбль 'lgb' из 5 конфигураций: lgb_default_s42, lgb_default_s7, lgb_deep511_lr02, lgb_deep1023_ff04, lgb_deep511_lr05
+[200]	valid_0's rmsle_aligned: 1.66993
+[400]	valid_0's rmsle_aligned: 1.67054
+  участник lgb_default_s42      итераций 225
+[200]	valid_0's rmsle_aligned: 1.67006
+  участник lgb_default_s7       итераций 199
+[200]	valid_0's rmsle_aligned: 1.67033
+[400]	valid_0's rmsle_aligned: 1.67122
+  участник lgb_deep511_lr02     итераций 223
+[200]	valid_0's rmsle_aligned: 1.671
+[400]	valid_0's rmsle_aligned: 1.67269
+  участник lgb_deep1023_ff04    итераций 205
+[200]	valid_0's rmsle_aligned: 1.67312
+  участник lgb_deep511_lr05     итераций 97
+[200]	valid_0's rmsle_aligned: 0.392585
+[400]	valid_0's rmsle_aligned: 0.392717
+[200]	valid_0's rmsle_aligned: 1.10107
+[400]	valid_0's rmsle_aligned: 1.10124
+
+--- валидация (cutoff 2026-01-15) ---
+        single | RMSLE 1.68148 | Gini 0.7381 | сумма -49.93%
+     two-stage | RMSLE 1.68350 | Gini 0.7389 | сумма -48.03%
+  blend w=0.55 | RMSLE 1.68203 | Gini 0.7387 | сумма -48.95%
+
+top-20 признаков (gain, single):
+  to_ord_sum_180               13,061,800
+  ord_days_180                 6,873,353
+  rk_ord_180                   5,215,775
+  rk_orddays_180               4,461,882
+  rk_ord_365                   2,086,961
+  ord_rate_lifetime            1,785,862
+  mean_ipi                     1,351,771
+  rk_lt_ord                    1,003,592
+  unit_price_cv                901,546
+  rk_orddays_365               725,962
+  ord_days_90                  562,622
+  rk_orddays_90                463,901
+  rk_gmv_365                   439,882
+  to_ord_sum_90                404,814
+  rk_ord_90                    337,009
+  gmv_sum_60                   314,431
+  rec_ord_rel                  268,121
+  gmv_sum_30                   240,425
+  rec_vs_max_gap               234,745
+  rk_mean_ipi                  214,817
+схема experiments.csv изменилась, файл перезаписан: 20 колонок
+записано в C:\Users\ecorn\ozon-repro\models\experiments.csv
+
+--- финальное обучение на всех 6 cutoff'ах (итераций x1.20) ---
+  участник lgb_default_s42      итераций 270
+  участник lgb_default_s7       итераций 238
+  участник lgb_deep511_lr02     итераций 267
+  участник lgb_deep1023_ff04    итераций 246
+  участник lgb_deep511_lr05     итераций 116
+модели и мета сохранены в C:\Users\ecorn\ozon-repro\models

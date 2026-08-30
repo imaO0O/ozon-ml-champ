@@ -1,0 +1,59 @@
+[2026-01-15] 250,000 строк x 247 колонок за 29.2s -> ds_train_2026-01-15_9db461e7_net-b64.parquet
+[2025-12-16] 250,000 строк x 247 колонок за 25.4s -> ds_train_2025-12-16_9db461e7_net-b64.parquet
+[2025-11-16] 244,983 строк x 247 колонок за 22.0s -> ds_train_2025-11-16_9db461e7_net-b64.parquet
+[2025-10-17] 240,700 строк x 247 колонок за 20.4s -> ds_train_2025-10-17_9db461e7_net-b64.parquet
+[2025-09-17] 236,668 строк x 247 колонок за 18.5s -> ds_train_2025-09-17_9db461e7_net-b64.parquet
+[2025-08-18] 232,977 строк x 247 колонок за 16.7s -> ds_train_2025-08-18_9db461e7_net-b64.parquet
+train: 1,205,328 строк (5 cutoff) | val: 250,000 (2026-01-15)
+признаков: 244 | доля покупателей в val: 54.066%
+одноголовая модель — ансамбль 'lgb' из 5 конфигураций: lgb_default_s42, lgb_default_s7, lgb_deep511_lr02, lgb_deep1023_ff04, lgb_deep511_lr05
+[200]	valid_0's rmsle_aligned: 1.66897
+  участник lgb_default_s42      итераций 134
+[200]	valid_0's rmsle_aligned: 1.66888
+  участник lgb_default_s7       итераций 129
+[200]	valid_0's rmsle_aligned: 1.66908
+  участник lgb_deep511_lr02     итераций 183
+[200]	valid_0's rmsle_aligned: 1.66954
+  участник lgb_deep1023_ff04    итераций 184
+[200]	valid_0's rmsle_aligned: 1.67299
+  участник lgb_deep511_lr05     итераций 70
+[200]	valid_0's rmsle_aligned: 0.392447
+[400]	valid_0's rmsle_aligned: 0.392607
+[200]	valid_0's rmsle_aligned: 1.10018
+
+--- валидация (cutoff 2026-01-15) ---
+        single | RMSLE 1.67959 | Gini 0.7381 | сумма -51.59%
+     two-stage | RMSLE 1.68080 | Gini 0.7392 | сумма -48.01%
+  blend w=0.50 | RMSLE 1.67973 | Gini 0.7388 | сумма -49.88%
+
+top-20 признаков (gain, single):
+  net_b64_centered             27,567,268
+  net_b64_rank                 9,819,427
+  ord_days_180                 1,643,030
+  rk_ord_180                   1,484,175
+  to_ord_sum_180               1,447,844
+  rk_orddays_180               739,152
+  rk_ord_365                   355,641
+  ord_rate_lifetime            301,116
+  rk_orddays_365               245,629
+  mean_ipi                     218,588
+  unit_price_cv                103,896
+  to_ord_sum_90                89,477
+  rk_lt_ord                    85,190
+  rec_ord_rel                  77,833
+  rk_gmv_365                   73,927
+  rec_vs_max_gap               63,650
+  gmv_sum_60                   58,180
+  search_to_ord_sum_180        49,312
+  rk_gmv_per_day_lt            48,020
+  searches_sum_14              46,510
+схема experiments.csv изменилась, файл перезаписан: 20 колонок
+записано в C:\Users\ecorn\ozon-repro\models\experiments.csv
+
+--- финальное обучение на всех 6 cutoff'ах (итераций x1.20) ---
+  участник lgb_default_s42      итераций 160
+  участник lgb_default_s7       итераций 154
+  участник lgb_deep511_lr02     итераций 219
+  участник lgb_deep1023_ff04    итераций 220
+  участник lgb_deep511_lr05     итераций 84
+модели и мета сохранены в C:\Users\ecorn\ozon-repro\models

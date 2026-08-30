@@ -1,0 +1,40 @@
+Sun Aug 30 15:29:04 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.94                 Driver Version: 560.94         CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3060      WDDM  |   00000000:01:00.0  On |                  N/A |
+|  0%   57C    P8             14W /  170W |     409MiB /  12288MiB |      5%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A      2256    C+G   ...n\151.0.4129.101\msedgewebview2.exe      N/A      |
+|    0   N/A  N/A      2288    C+G   ...CBS_cw5n1h2txyewy\TextInputHost.exe      N/A      |
+|    0   N/A  N/A      2292    C+G   ...0_x64__pzs8sxrjxfjjc\app\claude.exe      N/A      |
+|    0   N/A  N/A      5264    C+G   ...siveControlPanel\SystemSettings.exe      N/A      |
+|    0   N/A  N/A      8436    C+G   ....Search_cw5n1h2txyewy\SearchApp.exe      N/A      |
+|    0   N/A  N/A      8896    C+G   ...t.LockApp_cw5n1h2txyewy\LockApp.exe      N/A      |
+|    0   N/A  N/A     13520    C+G   ...crosoft\Edge\Application\msedge.exe      N/A      |
+|    0   N/A  N/A     14380    C+G   ...GeForce Experience\NVIDIA Share.exe      N/A      |
+|    0   N/A  N/A     15404    C+G   ....0_x64__kzh8wxbdkxb8p\DCv2\DCv2.exe      N/A      |
+|    0   N/A  N/A     17300    C+G   ...1.0_x64__8wekyb3d8bbwe\Video.UI.exe      N/A      |
+|    0   N/A  N/A     18796    C+G   ...gram Files\FlyFrogLLC\Happ\Happ.exe      N/A      |
+|    0   N/A  N/A     19480    C+G   ...m Files (x86)\VanyaVPN\VanyaVPN.exe      N/A      |
+|    0   N/A  N/A     20812    C+G   ...GeForce Experience\NVIDIA Share.exe      N/A      |
+|    0   N/A  N/A     22388    C+G   ...ndexBrowser\Application\browser.exe      N/A      |
+|    0   N/A  N/A     23544    C+G   C:\Windows\explorer.exe                     N/A      |
+|    0   N/A  N/A     23640    C+G   ...crosoft\Edge\Application\msedge.exe      N/A      |
+|    0   N/A  N/A     24160    C+G   ...ne\Binaries\Win64\EpicWebHelper.exe      N/A      |
+|    0   N/A  N/A     25512    C+G   ...inaries\Win64\EpicGamesLauncher.exe      N/A      |
+|    0   N/A  N/A     25708    C+G   ...0_x64__pzs8sxrjxfjjc\app\claude.exe      N/A      |
+|    0   N/A  N/A     26524    C+G   ...in\cef\cef.win64\steamwebhelper.exe      N/A      |
+|    0   N/A  N/A     27600    C+G   ...b3d8bbwe\Microsoft.Media.Player.exe      N/A      |
++-----------------------------------------------------------------------------------------+
