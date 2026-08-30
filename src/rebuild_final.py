@@ -33,6 +33,7 @@
 и размах, и кривизну (PLAN, «смесь разбавляет калибровку»).
 
     python -u src/rebuild_final.py
+    python -u src/rebuild_final.py --recipes # чем порождается каждая компонента
     python -u src/rebuild_final.py --write   # перезаписать финальные файлы
 """
 from __future__ import annotations
@@ -86,6 +87,39 @@ SEED_AVERAGES = {
 }
 
 
+# Чем порождается каждая компонента — с ТОЧНЫМ именем файла, которого ждёт
+# сборка. Раньше этого списка не было, и проверка «репозиторий воспроизводим»
+# была шире измерения: README доказывал, что модели обучаются, `rebuild_final`
+# доказывал, что из компонент собирается финал, а между ними зияла дыра —
+# **17 компонент из 22 не назывались в инструкциях вообще**, включая все сиды
+# 21 и 99, без которых pair_s6q не собрать. Обучив всё по README, человек
+# получал файлы под другими именами и упирался в отказ.
+#
+# `predict.py` по умолчанию пишет `<имя>_MMDD_HHMM.csv`, поэтому в рецептах
+# всюду стоит явный `--out`: имя прогон не идентифицирует, а сборка ждёт
+# конкретный файл.
+SEQ = "python -u src/seq_train.py"
+RECIPE = {
+    **{f"yearfin_s{s}": f"{SEQ} --lookback 364 --bin 7 --static rk_ --bins 64 "
+                        f"--seed {s} --final --name yearfin_s{s}"
+       for s in (42, 13, 7, 3, 21, 99)},
+    "nostfin": f"{SEQ} --lookback 90 --bins 64 --seed 42 --final --name nostfin",
+    **{f"nostfin_s{s}": f"{SEQ} --lookback 90 --bins 64 --seed {s} "
+                        f"--final --name nostfin_s{s}" for s in (13, 7, 3, 21, 99)},
+    "evfin": f"{SEQ} --lookback 364 --events 96 --static rk_ --bins 64 "
+             f"--seed 42 --final --name evfin",
+    **{f"evfin_s{s}": f"{SEQ} --lookback 364 --events 96 --static rk_ --bins 64 "
+                      f"--seed {s} --final --name evfin_s{s}" for s in (13, 7, 3, 21, 99)},
+    "stk2_raw": ("python -u src/train.py --cutoffs 6 --ensemble --net "
+                 "--net-names b64a --final --name lgbm_stk2\n"
+                 "     затем: python -u src/predict.py --name lgbm_stk2 "
+                 "--out stk2_raw.csv"),
+    "pair_ac": "половина трека C в паре с нашей: docs/jury/C3_reproduce.md",
+    "pair_ac_cal": "калиброванная версия pair_ac: docs/jury/C3_reproduce.md",
+    "cand_w2_cal": "текущая половина трека C: docs/jury/C3_reproduce.md",
+}
+
+
 def load(name: str) -> tuple[np.ndarray, np.ndarray]:
     """Компонента из `submissions/`. Внятный отказ, если её нет.
 
@@ -101,11 +135,14 @@ def load(name: str) -> tuple[np.ndarray, np.ndarray]:
     """
     path = SUBMISSIONS / f"{name}.csv"
     if not path.exists():
+        how = RECIPE.get(name, "рецепт неизвестен — см. README, раздел «Запуск»")
         raise SystemExit(
             f"нет компоненты {path.name}.\n"
             "Файлы предсказаний намеренно не хранятся в репозитории (готовые\n"
-            "ответы соревнования, см. .gitignore). Сначала соберите компоненты\n"
-            "конвейером из README, затем запускайте пересборку.")
+            "ответы соревнования, см. .gitignore). Порождается она так:\n\n"
+            f"     {how}\n\n"
+            "Полный список компонент с рецептами: python -u src/rebuild_final.py "
+            "--recipes")
     d = pl.read_csv(path).sort("user_id")
     return d["user_id"].to_numpy(), np.log1p(d["predict"].to_numpy())
 
@@ -190,7 +227,28 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true",
                     help="перезаписать финальные файлы (по умолчанию только сверка)")
+    ap.add_argument("--recipes", action="store_true",
+                    help="показать, чем порождается каждая компонента, и чего нет на диске")
     args = ap.parse_args()
+
+    if args.recipes:
+        need = set()
+        for _, parts, _ in CHAIN:
+            need |= set(parts)
+        for out, (parts, _) in SEED_AVERAGES.items():
+            need |= set(parts)
+            need.discard(out)
+        for arm in SEED6.values():
+            need |= set(arm)
+        need |= {"pair_ac"}
+        need -= {o for o, _, _ in CHAIN} | set(SEED_AVERAGES)
+        miss = [n for n in sorted(need) if not (SUBMISSIONS / f"{n}.csv").exists()]
+        print(f"компонент нужно финалу: {len(need)}, отсутствует: {len(miss)}\n")
+        for n in sorted(need):
+            mark = "НЕТ " if n in miss else "есть"
+            print(f"  [{mark}] {n}")
+            print(f"         {RECIPE.get(n, 'рецепт неизвестен')}")
+        return
 
     built: dict[str, np.ndarray] = {}
     uid = None
