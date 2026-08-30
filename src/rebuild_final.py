@@ -18,9 +18,15 @@
     GAMMA_AC   = -0.008076756  добор кривизны для pair_ac_cal
                            (в переписке округлялось до -0.00808; сверка
                             показала, что округление стоит 7e-6 на клиента)
-    GAMMA_Q    = -0.003429750255  добор кривизны для pair_q, ПЕРВЫЙ СЛОТ
+    GAMMA_Q    = -0.003429750255  добор кривизны для pair_q
                            (в журнале отправок записано -0.003430; та же
                             болезнь, цена округления 6.3e-6 на клиента)
+    GAMMA_CUB  = -0.000806576774  кубический член для pair_s6q
+                           (округление до восьмого знака стоило 3e-7 —
+                            третий случай той же болезни, поймано сверкой)
+
+Финальная пара с 30.08 — `pair_s6q.csv` и `pair_q.csv`; скрипт собирает
+и сверяет ОБА. Порядок слотов на счёт не влияет: в зачёт идёт лучшее из двух.
 
 Порядок операций внутри каждой смеси: сначала смешать, потом уровень, потом
 растяжение. Иначе поправки применяются не к тому объекту — смесь разбавляет
@@ -42,6 +48,22 @@ TEST_LEVEL = 2.32912
 TARGET_VAR = 2.6408
 GAMMA_AC = -0.008076756
 GAMMA_Q = -0.003429750255
+# Кубический член, решённый из одного зонда `probe_cub` (ответ 1.6468402135
+# при gamma3 = +0.0036, Var(h) = 25.64153) и уточнённый проекцией на само
+# кубическое направление: округление до восьмого знака давало расхождение
+# 3e-07, та же болезнь, что была у GAMMA_Q. Применяется поверх шестисидовой
+# цепочки и даёт `pair_s6q` — файл, вошедший в финальную пару 30.08.
+GAMMA_CUB = -0.000806576774
+# Шесть сидов на каждой сетевой руке. В отправленном 27.08 составе их было
+# 4/4/1 — недосмотр, а не решение (см. docs/jury/A2, редакция 30.08).
+SEED6 = {
+    "year": ["yearfin_s42", "yearfin_s13", "yearfin_s7", "yearfin_s3",
+             "yearfin_s21", "yearfin_s99"],
+    "nost": ["nostfin", "nostfin_s13", "nostfin_s7", "nostfin_s3",
+             "nostfin_s21", "nostfin_s99"],
+    "ev": ["evfin", "evfin_s13", "evfin_s7", "evfin_s3", "evfin_s21", "evfin_s99"],
+}
+FINAL_PAIR = ("pair_s6q.csv", "pair_q.csv")
 
 # (имя результата, из чего собирается, вес второго слагаемого)
 # Веса взяты: 0.56/0.085/0.19 — с двух валидационных срезов (усреднены);
@@ -124,6 +146,46 @@ def compare(name: str, p: np.ndarray) -> tuple[float, float]:
     return float(d.max()), float(d.mean())
 
 
+def cubic_basis(p: np.ndarray) -> np.ndarray:
+    """u³, очищенное от константы, u и квадратичного направления.
+
+    Повторяет `probe_cubic.cubic_dir`. Дублирование намеренное: этот скрипт
+    обязан собирать финал, ничего не импортируя из зондов, — иначе правка
+    в зонде молча меняет проверку отправленного файла.
+    """
+    u = p - p.mean()
+    g = u ** 2
+    g = g - g.mean()
+    g = g - (g @ u) / (u @ u) * u
+    h = u ** 3
+    h = h - h.mean()
+    h = h - (h @ u) / (u @ u) * u
+    return h - (h @ g) / (g @ g) * g
+
+
+def build_s6q(built: dict) -> np.ndarray:
+    """Цепочка на шести сидах каждой руки плюс кубический член."""
+    parts = {
+        "year": np.mean([load(n)[1] for n in SEED6["year"]], axis=0),
+        "nost": calibrate(np.mean([load(n)[1] for n in SEED6["nost"]], axis=0)),
+        "ev": calibrate(np.mean([load(n)[1] for n in SEED6["ev"]], axis=0)),
+    }
+    sub = {"stk2_raw": None, "yearfin_avg4": parts["year"],
+           "nostfin": None, "evfin": parts["ev"], "nost_avg": parts["nost"]}
+    acc = dict(built)
+    for out, names, ws in CHAIN:
+        cur = None
+        for i, n in enumerate(names):
+            p = sub[n] if sub.get(n) is not None else (
+                acc[n] if n in acc and n not in sub else load(n)[1])
+            lp = level(p)
+            cur = lp if cur is None else (1 - ws[i - 1]) * cur + ws[i - 1] * lp
+        acc[out] = calibrate(cur)
+    q = calibrate(acc["pair_nost"])
+    q = q + GAMMA_Q * quad_basis(q)
+    return q + GAMMA_CUB * cubic_basis(q)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true",
@@ -195,7 +257,21 @@ def main() -> None:
     if args.write:
         write(uid, q, "pair_ac_cal")
 
-    print("\nФИНАЛЬНАЯ ПАРА: pair_q.csv (первый слот), pair_ac_cal.csv (второй)")
+    # ФИНАЛЬНАЯ ПАРА сменилась 30.08, и этот скрипт обязан проверять ОБА её
+    # файла. До правки он собирал pair_q и pair_ac_cal и называл финалом их —
+    # ровно тот класс дефекта, который он сам ловит у рецептов: скрипт отстал
+    # от того, что реально отправлено. Второй раз за проект, поэтому теперь
+    # список финалов вынесен наверх и печатается из одного места.
+    print("\n--- также в паре: pair_s6q (шесть сидов на руку плюс кубический член) ---")
+    s6 = build_s6q(built)
+    mx, mn = compare("pair_s6q", s6)
+    print(f"  pair_s6q         gamma3 {GAMMA_CUB} | "
+          f"max {mx:.2e}, среднее {mn:.2e}  {'ОК' if mx < 1e-6 else 'РАСХОЖДЕНИЕ'}")
+    if args.write:
+        write(uid, s6, "pair_s6q")
+
+    print(f"\nФИНАЛЬНАЯ ПАРА: {' + '.join(FINAL_PAIR)}")
+    print("Порядок слотов на счёт не влияет: в зачёт идёт лучшее из двух.")
 
 
 if __name__ == "__main__":

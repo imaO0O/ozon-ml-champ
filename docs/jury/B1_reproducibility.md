@@ -39,7 +39,7 @@ README пройден построчно и сверен с кодом: флаг
 обещает `models/experiments.csv`, `models/tuning.csv`, `models/ensemble.csv`,
 `submissions/log.csv`. В `.gitignore` белый список из двух файлов: `models/*`
 с исключением `experiments.csv`, `submissions/*` с исключением `log.csv`.
-Проверено: в `models/` ровно один файл.
+Проверено: в `models/` отслеживаются **два** файла и оба журналы — `experiments.csv` (673 прогона) и `lgb_grid.csv` (перебор гиперпараметров, 10 строк). Предсказаний в репозитории нет ни одного.
 
 **A4. `models/calibration.txt` недостижим.** PLAN раздел 5 ссылается на него
 («Числа в models/calibration.txt»), но файл подпадает под `models/*`.
