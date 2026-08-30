@@ -222,6 +222,12 @@ def main() -> None:
                     help="одиночная рука на умолчаниях конвейера, без настроенных "
                          "параметров LGB_SINGLE_TUNED — нужен для контрольных прогонов, "
                          "чтобы не править код ради сравнения")
+    ap.add_argument("--seed-offset", type=int, default=0,
+                    help="прибавить к сиду каждого участника ансамбля. Нужен для "
+                         "усреднения по сидам: рука стекинга входит в состав трека C "
+                         "с весом 0.373, а считалась одним прогоном, где четыре "
+                         "участника из пяти сидят на одном сиде. Умолчание 0 — "
+                         "поведение прежнее, побитово.")
     ap.add_argument("--save-val-pred", action="store_true",
                     help="сохранить предсказания на валидации в models/<имя>_valpred_<срез>.npz "
                          "(user_id, pred_log, target) — для обмена с другими треками")
@@ -258,6 +264,16 @@ def main() -> None:
         if args.members not in MEMBER_SETS:
             raise SystemExit(f"нет состава '{args.members}'; есть: {', '.join(sorted(MEMBER_SETS))}")
         members = MEMBER_SETS[args.members]
+        if args.seed_offset:
+            # Смещение, а не замена: разнообразие конфигураций внутри ансамбля
+            # сохраняется, сдвигается только случайность. При замене два прогона
+            # отличались бы не одним фактором, а двумя.
+            members = [(f"{n}_o{args.seed_offset}", k,
+                        {**pr,
+                         **({"seed": pr["seed"] + args.seed_offset} if "seed" in pr else {}),
+                         **({"random_seed": pr["random_seed"] + args.seed_offset}
+                            if "random_seed" in pr else {})})
+                       for n, k, pr in members]
         print(f"одноголовая модель — ансамбль '{args.members}' из {len(members)} конфигураций: "
               + ", ".join(n for n, _, _ in members))
 
