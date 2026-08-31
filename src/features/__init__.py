@@ -11,6 +11,7 @@ user x day (~100 млн строк) не разворачиваем — все �
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 import polars as pl
 
@@ -25,7 +26,27 @@ __all__ = [
 
 
 def scan_log(path=TRAIN_PARQUET) -> pl.LazyFrame:
-    """Ленивое чтение лога с приведением event_date к Date."""
+    """Ленивое чтение лога с приведением event_date к Date.
+
+    Проверка существования файла стоит здесь, а не в тринадцати скриптах,
+    потому что через эту функцию проходят все пути к данным. Без неё первым,
+    что видел человек со свежим клоном, был `FileNotFoundError` из недр
+    polars — и не в каком-нибудь разовом разборе, а на **первой команде
+    README** (`datasets.py --test`). Замер 30.08 на чистом клоне: так падали
+    тринадцать скриптов из пятидесяти пяти.
+
+    Тот же приём уже стоял в `rebuild_final.load` для компонент; здесь он
+    обобщён на данные.
+    """
+    if not Path(path).exists():
+        raise SystemExit(
+            f"нет файла с логом: {path}\n\n"
+            "Данные в репозиторий не входят — их надо скачать с площадки\n"
+            "и положить в data/raw/ (папка создаётся сама при импорте config):\n\n"
+            "     data/raw/train.parquet        дневной лог активности\n"
+            "     data/raw/sample_submit.csv    эталон формата отправки\n\n"
+            "Путь можно задать и переменной окружения OZON_TRAIN.\n"
+            "Проверить установку без боевых данных: python -u src/make_fake_data.py")
     lf = pl.scan_parquet(path)
     schema = lf.collect_schema()
     if schema["event_date"] == pl.Utf8:
