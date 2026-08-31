@@ -344,7 +344,7 @@ def main() -> None:
         ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
          "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
          "gini_blend", "sum_bias_blend", "best_iter_single", "note", "val_cutoff",
-         "train_cutoffs", "stride", "halflife", "rmsle_aligned"],
+         "train_cutoffs", "stride", "halflife", "rmsle_aligned", "machine"],
         {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": git_commit(), "feat_ver": features_version(blocks),
