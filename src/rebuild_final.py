@@ -98,7 +98,15 @@ SEED_AVERAGES = {
 # `predict.py` по умолчанию пишет `<имя>_MMDD_HHMM.csv`, поэтому в рецептах
 # всюду стоит явный `--out`: имя прогон не идентифицирует, а сборка ждёт
 # конкретный файл.
-SEQ = "python -u src/seq_train.py"
+# `--save-val-pred` стоит в рецептах не ради сборки сабмита — для неё он
+# не нужен. Он нужен тому, кто повторит прогон на ДРУГОЙ карте: без него
+# после прогона остаются модель и сабмит, а величины валидации — нигде,
+# и сверять кроссмашинное расхождение приходится числами из переписки.
+# Ровно так и вышло: из пяти пар кроссмашинной таблицы три остались
+# непроверяемыми — прогоны шли по этим рецептам в чистом клоне, клон
+# удалён, `.npz` не сохранялись (разбор в B1). Шесть мегабайт на прогон —
+# цена того, чтобы следующий сверял числа, а не переписку.
+SEQ = "python -u src/seq_train.py --save-val-pred"
 RECIPE = {
     **{f"yearfin_s{s}": f"{SEQ} --lookback 364 --bin 7 --static rk_ --bins 64 "
                         f"--seed {s} --final --name yearfin_s{s}"
@@ -126,7 +134,7 @@ RECIPE = {
     "stk2_raw": ("четыре шага, порядок обязателен:\n"
                  "     1) три сети с --final:\n"
                  "        python -u src/seq_train.py --lookback 90 --static rk_ "
-                 "--bins 64\n"
+                 "--bins 64 --save-val-pred\n"
                  "           --seed {42,13,7} --final --name gru_b64a_f{сид}\n"
                  "     2) среднее трёх В LOG1P (не в рублях: там разница 0.47):\n"
                  "        gru_b64a_avg3 = expm1(mean(log1p(f42), log1p(f13), "
@@ -137,7 +145,7 @@ RECIPE = {
                  "           --name netoof_b64a --test-submission gru_b64a_avg3.csv\n"
                  "     4) python -u src/train.py --cutoffs 6 --ensemble --net "
                  "--net-names b64a\n"
-                 "           --final --name lgbm_stk2\n"
+                 "           --final --save-val-pred --name lgbm_stk2\n"
                  "        python -u src/predict.py --name lgbm_stk2 "
                  "--out stk2_raw.csv"),
     # Здесь стоял `cand_w2`, и это была ошибка ПЕРЕБОРА, а не опечатка:
