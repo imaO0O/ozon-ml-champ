@@ -337,10 +337,14 @@ def main() -> None:
     # можно было сравнивать между собой, а не по скриншотам в чате.
     append_csv(
         MODELS / "experiments.csv",
+        # Порядок колонок — РОВНО как в самом models/experiments.csv. Он разошёлся
+        # исторически, и из-за этого `append_csv` при каждом прогоне переписывал
+        # весь журнал целиком: 725 строк в диффе на одну добавленную. Поймано
+        # 30.08 на чистом клоне — прогон жюри по README делал ровно это.
         ["created", "commit", "feat_ver", "blocks", "name", "model", "cutoffs", "n_features",
          "rmsle_single", "rmsle_two_stage", "rmsle_blend", "blend_w",
-         "gini_blend", "sum_bias_blend", "best_iter_single", "stride", "halflife", "val_cutoff",
-         "train_cutoffs", "note"],
+         "gini_blend", "sum_bias_blend", "best_iter_single", "note", "val_cutoff",
+         "train_cutoffs", "stride", "halflife", "rmsle_aligned"],
         {
             "created": dt.datetime.now().isoformat(timespec="seconds"),
             "commit": git_commit(), "feat_ver": features_version(blocks),
@@ -355,6 +359,12 @@ def main() -> None:
             "rmsle_single": round(res["single"]["rmsle"], 5),
             "rmsle_two_stage": round(res["two_stage"]["rmsle"], 5),
             "rmsle_blend": round(res["blend"]["rmsle"], 5), "blend_w": round(best_w, 2),
+            # Выровненная величина: уровень правится на сабмите бесплатно,
+            # поэтому конфигурации сравнивают по форме. У бустинга она расходится
+            # с сырой не меньше, чем у сетей — у `xgb_jan` разрыв 0.012, —
+            # и до 30.08 колонка заполнялась только сетями.
+            "rmsle_aligned": round(rmse_log(yva_log, p_blend - p_blend.mean()
+                                            + yva_log.mean()), 5),
             "gini_blend": round(res["blend"]["gini"], 4),
             "sum_bias_blend": round(res["blend"]["sum_bias"], 4),
             "best_iter_single": single.best_iter, "note": args.note,
