@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+import console  # noqa: F401  (печать в консоли cp1251 — разбор в модуле)
 from metrics import gini_norm, rmse_log, sum_bias
 
 

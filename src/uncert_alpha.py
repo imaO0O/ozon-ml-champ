@@ -33,6 +33,8 @@ alpha на валидации 1.010, а на тесте измерено 1.0586.
 """
 import pathlib
 
+import console  # noqa: F401  (печать в консоли cp1251 — разбор в модуле)
+
 import numpy as np
 
 def _need(path):

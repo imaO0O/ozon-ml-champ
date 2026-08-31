@@ -5,6 +5,12 @@ import datetime as dt
 import os
 from pathlib import Path
 
+# Импорт ради побочного действия: в консоли cp1251 (русская Windows по
+# умолчанию) печать `−`, `×` или `σ` роняет скрипт после того, как работа
+# сделана. Разбор — в самом модуле. Здесь, потому что config импортируют
+# 55 скриптов из 61: одно место вместо соглашения «не забудь добавить».
+import console  # noqa: F401,E402
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA_RAW = ROOT / "data" / "raw"
 DATA_PROC = ROOT / "data" / "processed"

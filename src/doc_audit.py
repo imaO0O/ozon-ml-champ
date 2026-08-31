@@ -56,6 +56,8 @@ import re
 import subprocess
 import sys
 
+import console  # noqa: F401  (печать в консоли cp1251 — разбор в модуле)
+
 SUB_LOG = pathlib.Path("submissions/log.csv")
 # Область у проверок РАЗНАЯ, и это не небрежность.
 # Числа сверяются только по документам для читателя: `TASKS.md` — рабочий
