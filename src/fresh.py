@@ -71,7 +71,16 @@ def short_target(cutoff: dt.date, h: int, lf: pl.LazyFrame | None = None) -> pl.
         lf.filter((pl.col("event_date") >= cutoff) & (pl.col("event_date") < end))
         .group_by("user_id")
         .agg(pl.col("gmv").sum().alias("target"))
-        .collect(engine="streaming")
+        # in-memory, а не streaming: потоковый движок суммирует внутри группы в
+        # недетерминированном порядке, и две сборки подряд расходятся. Замерено
+        # здесь же, срез 2025-12-31: streaming даёт max |разницу| 3.64e-12,
+        # in-memory ровно ноль. Двенадцатый знак не пыль -- трек A измерил, что
+        # через хаотичность бустинга он стоит 0.00086 RMSLE (та же конфигурация
+        # после пересборки кэша встала на 144-й итерации вместо 152-й).
+        # Признаки намеренно остаются на streaming: там движок нужен по памяти,
+        # а детерминизм и так есть. Окно цели короткое, потоковый режим тут
+        # ничего не экономит.
+        .collect(engine="in-memory")
     )
 
 
